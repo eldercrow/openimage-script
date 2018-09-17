@@ -1,17 +1,8 @@
-# User defined
-data/*
-!data/demo/
-model/*
-!model/README.md
-cache/*
-.DS_Store
-
 # Compiled Object files
 *.slo
 *.lo
 *.o
 *.obj
-*.d
 
 # Precompiled Headers
 *.gch
@@ -37,6 +28,15 @@ cache/*
 *.app
 *~
 
+# doc
+doc/html
+doc/latex
+doc/doc
+docs/web-data
+
+#dmlc
+config.mk
+
 *.pyc
 .Rhistory
 *log
@@ -52,92 +52,141 @@ tracker
 .ycm_extra_conf.py
 .ycm_extra_conf.pyc
 
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
+# Emacs
+.#*
+.clang_complete
+.dir-locals.el
+__pycache__
+*.pkl
+*.params
+*.states
+*.json
+*.d
+build
+data
+recommonmark
+bin
+deps
 
-# C extensions
-*.so
+# R
+*.Rcheck
+*.rds
+*.Rproj
+.Rproj.user
+R-package/inst/*
+*.tar.gz
+*.tgz
+R-package/man/*.Rd
+R-package/R/mxnet_generated.R
 
-# Distribution / packaging
-.Python
-env/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-*.egg-info/
-.installed.cfg
-*.egg
+# data
+*.rec
+*.lst
+*.zip
+*ubyte
+*.bin
+*.txt
+*.npz
+*.pb
 
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+# ipython notebook
+*_pb2.py
+*.ipynb_checkpoints*
+input.txt*
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+# Jetbrain
+.idea
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*,cover
-.hypothesis/
+# ctags
+tags
 
-# Translations
-*.mo
-*.pot
+# image file
+*.jpg
+*.png
 
-# Django stuff:
+# Scala package
+*.class
+scala-package/*/target/
+scala-package/*/*/target/
+*.scala_dependencies
+*.worksheet
+*.idea
+*.iml
+*.classpath
+*.project
+*.settings
+!scala-package/*/bin
+*.bak
+*/node_modules/
+
+# Eclipse project config
+.project
+.cproject
+.pydevproject
+CMakeFiles
+cmake_install.cmake
+dmlc-core
+ps-lite
+nnvm
+!src/nnvm
+lib
+
+# Visual Studio Code
+.vscode
+
+# Mac OS X
+.DS_Store
+
+#Notebook Automated Test
+!tests/nightly/test_config.txt
+!tests/nightly/TestNotebook
+
+# pip building tools
+tools/pip_package/build
+tools/pip_package/dist
+tools/pip_package/mxnet.egg-info
+tools/pip_package/mxnet
+
+# temporary path for building dependencies when building wheel
+deps/
+
+*.jar
+target
+
+# latex
+*.aux
+*.glo
+*.idx
 *.log
-local_settings.py
+*.toc
+*.ist
+*.acn
+*.acr
+*.alg
+*.bbl
+*.blg
+*.dvi
+*.glg
+*.gls
+*.ilg
+*.ind
+*.lof
+*.lot
+*.maf
+*.mtc
+*.mtc1
+*.out
+*.synctex.gz
+*.pdf
 
-# Flask stuff:
-instance/
-.webassets-cache
+# others
+pretrained/
+data/
+notebook/data/
+# pycocotools/
+train_log/
+tensorflow
 
-# Scrapy stuff:
-.scrapy
-
-# Sphinx documentation
-docs/_build/
-
-# PyBuilder
-target/
-
-# IPython Notebook
-.ipynb_checkpoints
-
-# pyenv
-.python-version
-
-# celery beat schedule file
-celerybeat-schedule
-
-# dotenv
-.env
-
-# virtualenv
-venv/
-ENV/
-
-# Spyder project settings
-.spyderproject
-
-# Rope project settings
-.ropeproject
+#openvino
+frozen_graph*
+inference_graph*

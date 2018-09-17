@@ -1,3 +1,3 @@
 # openimage-script
 
-Personal codes for creating mxnet .rec files and training classifiers.
+Personal codes for training with Open Image Dataset.
