@@ -96,12 +96,13 @@ def get_imagenet_dataflow(
     assert isinstance(augmentors, list)
     isTrain = name == 'train'
     if parallel is None:
-        parallel = min(40, multiprocessing.cpu_count() // 2)  # assuming hyperthreading
+        parallel = min(40, multiprocessing.cpu_count() - 2)  # assuming hyperthreading
+        # parallel = min(40, multiprocessing.cpu_count() // 2)  # assuming hyperthreading
     if isTrain:
         ds = dataset.ILSVRC12(datadir, name, shuffle=True)
         ds = AugmentImageComponent(ds, augmentors, copy=False)
         if parallel < 16:
-            logger.warn("DataFlow may become the bottleneck when too few processes are used.")
+            logger.warn("DataFlow may become the bottleneck when too few processes ({}) are used.".format(parallel))
         ds = PrefetchDataZMQ(ds, parallel)
         ds = BatchData(ds, batch_size, remainder=False)
     else:

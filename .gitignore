@@ -190,3 +190,6 @@ tensorflow
 #openvino
 frozen_graph*
 inference_graph*
+
+#pvanet
+pva*
