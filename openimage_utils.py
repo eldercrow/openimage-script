@@ -11,7 +11,7 @@ from abc import abstractmethod
 from tensorpack import imgaug, dataset, ModelDesc
 from tensorpack.dataflow import (
     AugmentImageComponent, PrefetchDataZMQ,
-    BatchData, MultiThreadMapData)
+    BatchData, MultiThreadMapData, MapData)
 from tensorpack.predict import PredictConfig, SimpleDatasetPredictor
 from tensorpack.utils.stats import RatioCounter
 from tensorpack.models import regularize_cost
@@ -42,14 +42,15 @@ def get_openimage_dataflow(
         ds = PrefetchDataZMQ(ds, parallel)
         ds = BatchData(ds, batch_size, remainder=False)
     else:
-        ds = dataset.OpenImageFiles(datadir, name, shuffle=False)
+        ds = OpenImageFiles(datadir, name, shuffle=False)
         aug = imgaug.AugmentorList(augmentors)
 
         def mapf(dp):
-            fname, cls = dp
+            fname, labels, weights = dp
             im = cv2.imread(fname, cv2.IMREAD_COLOR)
             im = aug.augment(im)
-            return im, cls
+            return im, labels, weights
+        # ds = MapData(ds, mapf)
         ds = MultiThreadMapData(ds, parallel, mapf, buffer_size=2000, strict=True)
         ds = BatchData(ds, batch_size, remainder=True)
         ds = PrefetchDataZMQ(ds, 1)
@@ -60,17 +61,15 @@ def eval_on_OpenImage(model, sessinit, dataflow):
     pred_config = PredictConfig(
         model=model,
         session_init=sessinit,
-        input_names=['input', 'label'],
-        output_names=['wrong-top1', 'wrong-top5']
+        input_names=['input', 'labels', 'weights'],
+        output_names=['wrong-best1',]
     )
     pred = SimpleDatasetPredictor(pred_config, dataflow)
-    acc1, acc5 = RatioCounter(), RatioCounter()
-    for top1, top5 in pred.get_result():
-        batch_size = top1.shape[0]
-        acc1.feed(top1.sum(), batch_size)
-        acc5.feed(top5.sum(), batch_size)
-    print("Top1 Error: {}".format(acc1.ratio))
-    print("Top5 Error: {}".format(acc5.ratio))
+    acc1 = RatioCounter()
+    for best1 in pred.get_result():
+        batch_size = best1.shape[0]
+        acc1.feed(best1.sum(), batch_size)
+    print("Best1 Error: {}".format(acc1.ratio))
 
 
 class OpenImageModel(ModelDesc):
@@ -107,11 +106,11 @@ class OpenImageModel(ModelDesc):
 
     def inputs(self):
         return [tf.placeholder(self.image_dtype, [None, self.image_shape, self.image_shape, 3], 'input'),
-                tf.placeholder(tf.int32, [None, 601], 'labels'),
-                tf.placeholder(tf.int32, [None, 601], 'weights')]
+                tf.placeholder(tf.float32, [None, 601], 'labels'),
+                tf.placeholder(tf.float32, [None, 601], 'weights')]
 
     def build_graph(self, image, labels, weights):
-        image = ImageNetModel.image_preprocess(image, bgr=self.image_bgr)
+        image = OpenImageModel.image_preprocess(image, bgr=self.image_bgr)
         assert self.data_format in ['NCHW', 'NHWC']
         if self.data_format == 'NCHW':
             image = tf.transpose(image, [0, 3, 1, 2])
@@ -123,7 +122,7 @@ class OpenImageModel(ModelDesc):
             wd_loss = regularize_cost(self.weight_decay_pattern,
                                       tf.contrib.layers.l2_regularizer(self.weight_decay),
                                       name='l2_regularize_loss')
-            add_moving_summary(sigmoid_loss, softmax_loss, wd_loss)
+            add_moving_summary([sigmoid_loss, softmax_loss, wd_loss])
             total_cost = tf.add_n([sigmoid_loss, softmax_loss, wd_loss], name='cost')
         else:
             total_cost = tf.add_n([sigmoid_loss, softmax_loss], name='cost')
@@ -136,7 +135,7 @@ class OpenImageModel(ModelDesc):
             return total_cost
 
     @abstractmethod
-    def get_logits(self, image):
+    def get_logits(self, image, num_classes):
         """
         Args:
             image: 4D tensor of ``self.input_shape`` in ``self.data_format``
@@ -178,10 +177,12 @@ class OpenImageModel(ModelDesc):
         softmax = tf.nn.softmax(logits, axis=-1)
         # reweight softmax
         w_softmax = softmax * tf.to_float(weights)
-        w_softmax = tf.truediv(w_softmax, tf.reduce_sum(w_softmax, axis=-1, keepdims=True))
+        w_softmax = tf.truediv(w_softmax, tf.maximum(1.0, tf.reduce_sum(w_softmax, axis=-1, keepdims=True)))
         # loss = -log(sum of probs from all positive labels)
-        sum_w_softmax = tf.reduce_sum(w_softmax * tf.to_float(labels), axis=-1, keepdims=True)
+        sum_w_softmax = tf.maximum(1e-08,
+                                   tf.reduce_sum(w_softmax * tf.to_float(labels), axis=-1, keepdims=True))
         softmax_loss = tf.reduce_mean(-tf.log(sum_w_softmax), name='softmax_loss')
+        # softmax_loss = tf.truediv(softmax_loss, 10.0, name='scaled_softmax_loss')
 
         # loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=label)
         # loss = tf.reduce_mean(loss, name='xentropy-loss')
@@ -191,10 +192,11 @@ class OpenImageModel(ModelDesc):
                 _, top1 = tf.nn.top_k(logits, k=1)
                 top1 = tf.one_hot(top1[:, 0], depth=tf.shape(logits)[1])
                 x = tf.reduce_max(top1 * tf.to_float(labels), axis=1)
-            return tf.cast(x, tf.float32, name=name)
+            return tf.subtract(1.0, tf.to_float(x), name=name)
+            # return tf.cast(x, tf.float32, name=name)
 
-        best1 = prediction_best1(logits, labels, weights, name='correct-best1')
-        add_moving_summary(tf.reduce_mean(best1, name='train-acc-best1'))
+        best1 = prediction_best1(logits, labels, weights, name='wrong-best1')
+        add_moving_summary(tf.reduce_mean(best1, name='train-error-best1'))
 
         return sigmoid_loss, softmax_loss
 

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # File: ilsvrc.py
 
+import cv2
 import os
 import tarfile
 import numpy as np
@@ -11,9 +12,9 @@ from tensorpack.utils import logger
 # from tensorpack.utils.loadcaffe import get_caffe_pb
 from tensorpack.utils.fs import mkdir_p #, download, get_dataset_path
 from tensorpack.utils.timer import timed_operation
-from tensorpack.dataflow.base import RNGDataFlow
+from tensorpack.dataflow.base import DataFlow, RNGDataFlow
 
-__all__ = ['OpenImageMeta', 'OpenImageFiles', 'OpenImage']
+__all__ = ['OpenImageMeta', 'OpenImage', 'OpenImageFiles']
 
 # CAFFE_OpenImage12_URL = ("http://dl.caffe.berkeleyvisin.org/caffe_ilsvrc12.tar.gz", 17858008)
 
@@ -136,7 +137,7 @@ class OpenImageFiles(RNGDataFlow):
         assert os.path.isdir(self.img_dir), self.img_dir
         # assert meta_dir is None or os.path.isdir(meta_dir), meta_dir
         if shuffle is None:
-            shuffle = name == 'train'
+            shuffle = (name == 'train')
         self.shuffle = shuffle
 
         # if name == 'train':
@@ -146,12 +147,12 @@ class OpenImageFiles(RNGDataFlow):
 
         meta = OpenImageMeta(path_db)
         self.imglist = meta.get_image_list(name)
+        assert len(self.imglist) > 0
 
-        for fname, _, _ in self.imglist[:10]:
-            fname = os.path.join(self.img_dir, fname + '.jpg')
-            if not os.path.isfile(fname):
-                print(fname)
-            # assert os.path.isfile(fname), fname
+        # for fname, _, _ in self.imglist[:10]:
+        #     fname = os.path.join(self.img_dir, fname + '.jpg')
+        #     if not os.path.isfile(fname):
+        #         print(fname)
 
     def __len__(self):
         return len(self.imglist)
@@ -163,10 +164,17 @@ class OpenImageFiles(RNGDataFlow):
         for k in idxs:
             fname, pos_labels, neg_labels = self.imglist[k]
             fname = os.path.join(self.img_dir, fname + '.jpg')
-            yield [fname, pos_labels, neg_labels]
+            labels = np.zeros((601), dtype=np.float32)
+            weights = \
+                    np.zeros((601), dtype=np.float32) \
+                    if neg_labels else \
+                    np.ones((601), dtype=np.float32)
+            labels[pos_labels] = 1
+            weights[pos_labels + neg_labels] = 1
+            yield fname, labels, weights
 
-    def get_data(self):
-        return self.__iter__()
+    # def get_data(self):
+    #     return self.__iter__()
 
 
 class OpenImage(OpenImageFiles):
@@ -196,10 +204,10 @@ class OpenImage(OpenImageFiles):
     https://github.com/tensorflow/models/blob/c0cd713f59cfe44fa049b3120c417cc4079c17e3/research/inception/inception/data/build_imagenet_data.py#L264-L300
     """
     def __iter__(self):
-        for fname, pos_labels, neg_labels in super(OpenImage, self).__iter__():
+        for fname, labels, weights in super(OpenImage, self).__iter__():
             im = cv2.imread(fname, cv2.IMREAD_COLOR)
             assert im is not None, fname
-            yield [im, pos_labels, neg_labels]
+            yield [im, labels, weights]
 
     # @staticmethod
     # def get_training_bbox(bbox_dir, imglist):
@@ -236,7 +244,7 @@ if __name__ == '__main__':
     # meta = OpenImageMeta('./data')
     # print(meta.get_synset_words_1000())
 
-    ds = OpenImageFiles('./data', 'train', shuffle=True)
+    ds = OpenImageFiles('~/dataset/openimage', 'train', shuffle=True)
     ds.reset_state()
 
     for ii, k in enumerate(ds):
