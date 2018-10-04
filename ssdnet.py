@@ -37,122 +37,124 @@ TOTAL_BATCH_SIZE = 512
 
 @contextmanager
 def ssdnet_argscope():
-    with argscope([Conv2D, MaxPooling, BatchNorm, GlobalAvgPooling], data_format='NHWC'), \
+    with argscope([Conv2D, MaxPooling, BatchNorm, GlobalAvgPooling, DWConv], data_format='NHWC'), \
             argscope([Conv2D, FullyConnected], use_bias=False):
         yield
 
 
 @layer_register(log_shape=True)
-def DWConv(x, kernel, padding='SAME', stride=1, data_format='NHWC', w_init=None): #, active=True):
+def DWConv(x, kernel, padding='SAME', stride=1, w_init=None, data_format='NHWC'): #, active=True):
     '''
     Depthwise conv + BN + (optional) ReLU.
     We do not use channel multiplier here (fixed as 1).
     '''
     assert data_format in ('NHWC', 'channels_last')
-    channel = tf.shape(x)[-1]
+    channel = x.get_shape().as_list()[-1]
     if not isinstance(kernel, (list, tuple)):
         kernel = [kernel, kernel]
-    filter_shape = [1, kernel[0], kernel[1], channel, 1]
+    filter_shape = [kernel[0], kernel[1], channel, 1]
 
     if w_init is None:
         w_init = tf.variance_scaling_initializer(2.0)
     W = tf.get_variable('W', filter_shape, initializer=w_init)
-    out = tf.nn.depthwise_conv2d(x, W, [1, 1, stride, stride], padding=padding, data_format=data_format)
+    out = tf.nn.depthwise_conv2d(x, W, [1, stride, stride, 1], padding=padding, data_format=data_format)
 
     out = BNReLU(out) #if active else BatchNorm(out)
     return out
 
 
 @layer_register(log_shape=True)
-def LinearBottleneck(x, och, kernel,
+def LinearBottleneck(x, ich, och, kernel,
                      padding='SAME',
                      stride=1,
                      active=False,
                      mu=6,
-                     data_format='NHWC',
                      w_init=None):
     '''
     mobilenetv2 linear bottlenet.
     '''
-    assert data_format in ('NHWC', 'channels_last')
 
-    ich = tf.shape(x)[-1]
-    out = Conv2D('conv_e', x, ich*mu, activation=BNReLU)
-    out = DWConv('conv_d', out, kernel, padding, stride, data_format, w_init)
-    out = Conv2D('conv_p', out, och, activation=(BNReLU if active else BatchNorm))
+    out = Conv2D('conv_e', x, int(ich*mu), 1, activation=BNReLU)
+    out = DWConv('conv_d', out, kernel, padding, stride, w_init)
+    if active:
+        out = Conv2D('conv_p', out, och, 1, activation=BNReLU)
+    else:
+        out = Conv2D('conv_p', out, och, 1, activation=None)
+        with tf.variable_scope('conv_p'):
+            out = BatchNorm('bn', out)
     return out
 
 
+
+
+# @layer_register(log_shape=True)
+# def DownsampleBottleneck(x, och, kernel,
+#                          padding='SAME',
+#                          stride=2,
+#                          active=False,
+#                          mu=3,
+#                          w_init=None):
+#     '''
+#     mobilenetv2 linear bottlenet.
+#     '''
+#
+#     ich = tf.shape(x)[-1]
+#     out_e = Conv2D('conv_e', x, ich*mu, activation=BNReLU)
+#     out_d = DWConv('conv_d', out_e, kernel, padding, stride, w_init)
+#     out_m = MaxPooling('pool_d', out_e, kernel, stride, padding)
+#     out = tf.concat([out_d, out_m])
+#     out = Conv2D('conv_p', out, och, activation=(BNReLU if active else BatchNorm))
+#     return out
+
+
 @layer_register(log_shape=True)
-def DownsampleBottleneck(x, och, kernel,
-                         padding='SAME',
-                         stride=2,
-                         active=False,
-                         mu=3,
-                         data_format='NHWC',
-                         w_init=None):
-    '''
-    mobilenetv2 linear bottlenet.
-    '''
-    assert data_format in ('NHWC', 'channels_last')
-
-    ich = tf.shape(x)[-1]
-    out_e = Conv2D('conv_e', x, ich*mu, activation=BNReLU)
-    out_d = DWConv('conv_d', out_e, kernel, padding, stride, data_format, w_init)
-    out_m = MaxPooling('pool_d', out_e, kernel, stride, padding, data_format)
-    out = tf.concat([out_d, out_m])
-    out = Conv2D('conv_p', out, och, activation=(BNReLU if active else BatchNorm))
-    return out
-
-
-@layer_register(log_shape=True)
-def inception(x, och, stride, mu=6, data_format='NHWC', w_init=None):
+def inception(x, ich, och, stride, mu=6, w_init=None):
     '''
     ssdnet inception layer.
     '''
-    assert data_format in ('NHWC', 'channels_last')
 
-    ich = tf.shape(x)[-1]
-    out = Conv2D('conv_c', x, ich, activation=BatchNorm)
+    ich = x.get_shape().as_list()[-1]
 
-    o1 = LinearBottleneck('conv1', out, ich, 3, mu=mu, data_format=data_format, w_init=w_init) \
-         if stride == 1 else \
-         DownsampleBottleneck('conv1', out, ich, 3, mu=mu//2, data_format=data_format, w_init=w_init)
-    o2 = LinearBottleneck('conv2', o1, ich//2, 3, mu=mu, data_format=data_format, w_init=w_init)
-    o3 = LinearBottleneck('conv3', o2, ich//2, 5, mu=mu, data_format=data_format, w_init=w_init)
+    k = 4 if stride == 2 else 3
+    o1 = LinearBottleneck('conv1', x, ich//stride, ich, k, stride=stride, mu=mu, w_init=w_init)
+    o2 = LinearBottleneck('conv2', o1, ich, ich//2, 3, mu=mu, w_init=w_init)
+    o3 = LinearBottleneck('conv3', o2, ich//2, ich//2, 5, mu=mu, w_init=w_init)
 
     out = tf.concat([o1, o2, o3], -1)
+    out = Conv2D('conv_c', out, och, 1, activation=None)
+    with tf.variable_scope('conv_c'):
+        out = BatchNorm('bn', out)
     if stride == 1:
         out = out + x
     return out
 
 
 def _get_logits(image, num_classes=1000):
-    with pvanet_argscope():
+    with ssdnet_argscope():
         l = image #tf.transpose(image, perm=[0, 2, 3, 1])
         # conv1
         l = Conv2D('conv1', l, 18, 4, strides=2, activation=None, padding='SAME')
         with tf.variable_scope('conv1'):
             l = BNReLU(tf.concat([l, -l], -1))
         # pool2
-        l = MaxPooling('pool2', l, 3, 2, 'SAME', data_format)
+        l = MaxPooling('pool2', l, 2, strides=2, padding='SAME')
         # conv3
-        l = LinearBottleneck('conv3', 24, 3, mu=4, data_format=data_format)
+        l = LinearBottleneck('conv3', l, 18, 24, 3, mu=4)
 
         # inception layers
         ichs = [24, 48, 96]
         ochs = [i*2 for i in ichs]
-        iters = [2, 3, 3]
+        iters = [1, 3, 2]
         mu = 6
         for ii, (ich, och, it) in enumerate(zip(ichs, ochs, iters)):
             with tf.variable_scope('inc{}'.format(ii)):
                 for jj in range(it):
                     stride = 2 if jj == 0 else 1
-                    l = inception('{}'.format(jj), och, stride, mu, data_format)
-        l = Conv2D('convf', l, 576, activation=BNReLU)
+                    l = inception('{}'.format(jj), l, ich, och, stride, mu)
+        l = Conv2D('convf', l, 576, 1, activation=BNReLU)
 
-        # should be 7x7 from this stage, with input size (224, 224)
-        s = tf.shape(l)
+        # should be 7x7 at this stage, with input size (224, 224)
+        s = l.get_shape().as_list()
         l = tf.reshape(l, [s[0], -1])
         ll = tf.split(l, s[1]*s[2], -1)
         ll = [FullyConnected('psroi_proj{}'.format(i), l, 20, activation=BNReLU) \
