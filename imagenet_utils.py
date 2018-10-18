@@ -157,12 +157,12 @@ class ImageNetModel(ModelDesc):
     """
     image_bgr = True
 
-    weight_decay = 1e-4
+    weight_decay = 4e-05
 
     """
     To apply on normalization parameters, use '.*/W|.*/gamma|.*/beta'
     """
-    weight_decay_pattern = '.*/W'
+    weight_decay_pattern = '.*/(?:W|gamma)'
 
     """
     Scale the loss, for whatever reasons (e.g., gradient averaging, fp16 training, etc)
@@ -233,7 +233,8 @@ class ImageNetModel(ModelDesc):
     @staticmethod
     def compute_loss_and_error(logits, label):
         loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=label)
-        loss = tf.reduce_mean(loss, name='xentropy-loss')
+        rw = tf.random_uniform(tf.shape(loss), 0, 2)
+        loss = tf.reduce_mean(loss*rw, name='xentropy-loss')
 
         def prediction_incorrect(logits, label, topk=1, name='incorrect_vector'):
             with tf.name_scope('prediction_incorrect'):

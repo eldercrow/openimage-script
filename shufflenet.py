@@ -22,7 +22,7 @@ from imagenet_utils import (
     get_imagenet_dataflow,
     ImageNetModel, GoogleNetResize, eval_on_ILSVRC12)
 
-TOTAL_BATCH_SIZE = 1024
+TOTAL_BATCH_SIZE = 512
 
 
 @layer_register(log_shape=True)
@@ -88,13 +88,15 @@ def shufflenet_unit_v2(l, out_channel, stride):
         shortcut, l = l, l
     shortcut_channel = int(shortcut.shape[1])
 
+    kernel = 4 if stride == 2 else 3
+
     l = Conv2D('conv1', l, out_channel // 2, 1, activation=BNReLU)
-    l = DepthConv('dconv', l, out_channel // 2, 3, stride=stride)
+    l = DepthConv('dconv', l, out_channel // 2, kernel, stride=stride)
     l = BatchNorm('dconv_bn', l)
     l = Conv2D('conv2', l, out_channel - shortcut_channel, 1, activation=BNReLU)
 
     if stride == 2:
-        shortcut = DepthConv('shortcut_dconv', shortcut, shortcut_channel, 3, stride=2)
+        shortcut = DepthConv('shortcut_dconv', shortcut, shortcut_channel, kernel, stride=2)
         shortcut = BatchNorm('shortcut_dconv_bn', shortcut)
         shortcut = Conv2D('shortcut_conv', shortcut, shortcut_channel, 1, activation=BNReLU)
     output = tf.concat([shortcut, l], axis=1)
@@ -117,7 +119,7 @@ def shufflenet_stage(input, channel, num_blocks, group):
 class Model(ImageNetModel):
     weight_decay = 4e-5
 
-    def get_logits(self, image):
+    def get_logits(self, image, num_classes=1000):
 
         with argscope([Conv2D, MaxPooling, AvgPooling, GlobalAvgPooling, BatchNorm], data_format='channels_first'), \
                 argscope(Conv2D, use_bias=False):
@@ -145,7 +147,7 @@ class Model(ImageNetModel):
 
             logger.info("#Channels: " + str([first_chan] + channels))
 
-            l = Conv2D('conv1', image, first_chan, 3, strides=2, activation=BNReLU)
+            l = Conv2D('conv1', image, first_chan, 4, strides=2, activation=BNReLU)
             l = MaxPooling('pool1', l, 3, 2, padding='SAME')
 
             l = shufflenet_stage('stage2', l, channels[0], 4, group)
@@ -156,7 +158,7 @@ class Model(ImageNetModel):
                 l = Conv2D('conv5', l, 1024, 1, activation=BNReLU)
 
             l = GlobalAvgPooling('gap', l)
-            logits = FullyConnected('linear', l, 1000)
+            logits = FullyConnected('linear', l, num_classes)
             return logits
 
 
@@ -166,7 +168,7 @@ def get_data(name, batch):
     if isTrain:
         augmentors = [
             # use lighter augs if model is too small
-            GoogleNetResize(crop_area_fraction=0.49 if args.ratio < 1 else 0.08),
+            GoogleNetResize(crop_area_fraction=0.49 if args.ratio < 1 else 0.16),
             imgaug.RandomOrderAug(
                 [imgaug.BrightnessScale((0.6, 1.4), clip=False),
                  imgaug.Contrast((0.6, 1.4), clip=False),
@@ -200,7 +202,7 @@ def get_config(model, nr_tower):
     dataset_val = get_data('val', batch)
 
     step_size = 1280000 // TOTAL_BATCH_SIZE
-    max_iter = 3 * 10**5
+    max_iter = 6 * 10**5
     max_epoch = (max_iter // step_size) + 1
     callbacks = [
         ModelSaver(),
@@ -231,7 +233,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--gpu', help='comma separated list of GPU(s) to use.')
     parser.add_argument('--data', help='ILSVRC dataset dir')
-    parser.add_argument('-r', '--ratio', type=float, default=0.5, choices=[1., 0.5])
+    parser.add_argument('-r', '--ratio', type=float, default=1.0, choices=[1., 0.5])
     parser.add_argument('--group', type=int, default=8, choices=[3, 4, 8],
                         help="Number of groups for ShuffleNetV1")
     parser.add_argument('--v2', action='store_true', help='Use ShuffleNetV2')
