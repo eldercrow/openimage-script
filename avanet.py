@@ -32,163 +32,103 @@ from imagenet_utils import ImageNetModel as _ImageNetModel
 from openimage_utils import get_openimage_dataflow
 from openimage_utils import OpenImageModel as _OpenImageModel
 
-# TOTAL_BATCH_SIZE = 1024 #512
+TOTAL_BATCH_SIZE = 512
 
 
 @contextmanager
-def ssdnet_argscope():
-    with argscope([Conv2D, MaxPooling, BatchNorm, GlobalAvgPooling, DWConv], data_format='NHWC'), \
-            argscope([Conv2D, FullyConnected], use_bias=False), \
-            argscope([BatchNorm], momentum=0.999):
+def pvanet_argscope():
+    with argscope([Conv2D, MaxPooling, BatchNorm, GlobalAvgPooling], data_format='NHWC'), \
+            argscope([Conv2D, FullyConnected], use_bias=False):
         yield
 
 
 @layer_register(log_shape=True)
-def DWConv(x, kernel, padding='SAME', stride=1, w_init=None, active=True, data_format='NHWC'):
+def inception(data, ch, t, ndiv):
     '''
-    Depthwise conv + BN + (optional) ReLU.
-    We do not use channel multiplier here (fixed as 1).
     '''
-    assert data_format in ('NHWC', 'channels_last')
-    channel = x.get_shape().as_list()[-1]
-    if not isinstance(kernel, (list, tuple)):
-        kernel = [kernel, kernel]
-    filter_shape = [kernel[0], kernel[1], channel, 1]
+    ich = int(ch * t)
+    bch = ich // ndiv
+    ch1 = int(bch * (ndiv - 1))
+    ch3 = bch
+    # ch2 = ch3 // 2
 
-    if w_init is None:
-        w_init = tf.variance_scaling_initializer(2.0)
-    W = tf.get_variable('W', filter_shape, initializer=w_init)
-    out = tf.nn.depthwise_conv2d(x, W, [1, stride, stride, 1], padding=padding, data_format=data_format)
+    l1 = Conv2D('conv1', data, ch1, 1, activation=BNReLU)
+    l3 = Conv2D('conv3/1', data, ch3, 1, padding='SAME', activation=BNReLU)
+    l3 = Conv2D('conv3/2', l3, ch3, 3, padding='SAME', activation=BNReLU)
 
-    if active is None:
-        return out
-
-    out = BNReLU('bn', out) if active else BatchNorm('bn', out)
-    return out
-
+    lc = tf.concat([l1, l3], axis=-1)
+    lc = Conv2D('convc', lc, ch, 1, activation=None)
+    with tf.variable_scope('convc'):
+        lc = BatchNorm('bn', lc)
+    return tf.add(data, lc, name='out')
 
 @layer_register(log_shape=True)
-def LinearBottleneck(x, ich, och, kernel,
-                     padding='SAME',
-                     stride=1,
-                     active=False,
-                     t=6,
-                     w_init=None):
+def downception(data, ch, t, ndiv):
     '''
-    mobilenetv2 linear bottlenet.
     '''
-    out = Conv2D('conv_e', x, int(ich*t), 1, activation=BNReLU)
-    out = DWConv('conv_d', out, kernel, padding, stride, w_init, active)
-    # if active:
-    #     out = Conv2D('conv_p', out, och, 1, activation=BNReLU)
-    # else:
-    out = Conv2D('conv_p', out, och, 1, activation=None)
-    with tf.variable_scope('conv_p'):
-        out = BatchNorm('bn', out)
-    return out
+    ich = int(ch * t)
+    bch = ich // ndiv
+    ch1 = int(bch * (ndiv - 1))
+    ch3 = bch
+    ch2 = ch3 // 2
+
+    l1 = Conv2D('conv1', data, ch1, 1, activation=BNReLU)
+    l1 = MaxPooling('pool1', l1, 2, strides=2, padding='SAME')
+    l3 = Conv2D('conv3/1', data, ch2, 1, padding='SAME', activation=BNReLU)
+    l3 = Conv2D('conv3/2', l3, ch3, 4, strides=2, padding='SAME', activation=BNReLU)
+
+    lc = tf.concat([l1, l3], axis=-1)
+    lc = Conv2D('convc', lc, ch, 1, activation=None)
+    with tf.variable_scope('convc'):
+        lc = BatchNorm('bn', lc)
+    return lc
 
 
-@layer_register(log_shape=True)
-def DownsampleBottleneck(x, ich, och, kernel,
-                         padding='SAME',
-                         stride=2,
-                         active=False,
-                         t=6,
-                         w_init=None):
-    '''
-    downsample linear bottlenet.
-    '''
-    out_e = Conv2D('conv_e', x, int(ich*t), 1, activation=BNReLU)
-    out_d = DWConv('conv_d', out_e, kernel, padding, stride, w_init)
-    out_m = DWConv('conv_m', out_e, kernel, padding, stride, w_init)
-    out = tf.concat([out_d, out_m], axis=-1)
-    # if active:
-    #     out = Conv2D('conv_p', out, och, 1, activation=BNReLU)
-    # else:
-    out = Conv2D('conv_p', out, och, 1, activation=None)
-    with tf.variable_scope('conv_p'):
-        out = BatchNorm('bn', out)
-    return out
-
-
-@layer_register(log_shape=True)
-def inception(x, ich, stride, t=3, swap_block=False, w_init=None):
-    '''
-    ssdnet inception layer.
-    '''
-    k = 4 if stride == 2 else 3
-    och = ich * 2
-    if stride == 1:
-        oi = LinearBottleneck('conv1', x, och, och, k, stride=stride, t=t, w_init=w_init)
-    else:
-        oi = DownsampleBottleneck('conv1', x, ich, och, k, stride=stride, t=t, w_init=w_init)
-    oi = tf.split(oi, 2, axis=-1)
-    o1 = oi[0]
-    o2 = oi[1] + LinearBottleneck('conv2', oi[1], ich, ich, 5, t=t, w_init=w_init, active=False)
-    # o3 = LinearBottleneck('conv3', o2, ich//2, ich//2, 5, t=t, w_init=w_init)
-
-    if not swap_block:
-        out = tf.concat([o1, o2], -1)
-    else:
-        out = tf.concat([o2, o1], -1)
-    # out = Conv2D('conv_c', out, och, 1, activation=None)
-    # with tf.variable_scope('conv_c'):
-    #     out = BatchNorm('bn', out)
-    if stride == 1:
-        out = tf.add(out, x)
-    return out
-
-
-def _get_logits(image, num_classes=1000, mu=1.0):
-    with ssdnet_argscope():
+def _get_logits(image, num_classes=1000):
+    with pvanet_argscope():
         l = image #tf.transpose(image, perm=[0, 2, 3, 1])
-
         # conv1
-        ch1 = int(round(12 * mu))
-        l = Conv2D('conv1', l, ch1, 4, strides=2, activation=None, padding='SAME')
+        l = Conv2D('conv1', l, 12, 4, strides=2, activation=None, padding='SAME')
         with tf.variable_scope('conv1'):
             l = BNReLU(tf.concat([l, -l], -1))
-
         # conv2
-        ch2 = ch1 * 2
-        l = DownsampleBottleneck('conv2', l, ch2, ch2, 4, t=1)
+        l = Conv2D('conv2', l, 48, 1, activation=BNReLU)
+        l = MaxPooling('pool2', l, 2, strides=2, padding='SAME')
+        # conv3
+        l = Conv2D('conv3', l, 24, 1, activation=None)
+        l = BatchNorm('conv3/bn', l)
 
-        # inception layers
-        ich0 = ch2 # base=24
-        ichs = [int(round(ich0*c)) for c in (1, 2, 4)]
-        ochs = [i*2 for i in ichs]
-        iters = [2, 4, 2]
-        t = 3
-        for ii, (ich, och, it) in enumerate(zip(ichs, ochs, iters)):
-            with tf.variable_scope('inc{}'.format(ii)):
-                for jj in range(it):
-                    stride = 2 if jj == 0 else 1
-                    l = inception('{}'.format(jj), l, ich, stride, t, (jj%2==1))
+        channels = [48, 96, 192]
+        iters = [2, 6, 3]
+        ndivs = [4, 6, 6]
+        mults = [2, 3, 3]
+        for ii, (ch, it, ndiv, t) in enumerate(zip(channels, iters, ndivs, mults)):
+            for jj in range(it):
+                name = 'inc{}/{}'.format(ii+1, jj+1)
+                if jj == 0:
+                    l = downception(name, l, ch, t, ndiv)
+                else:
+                    l = inception(name, l, ch, t, ndiv)
 
-        # # should be 7x7 at this stage, with input size (224, 224)
-        # l = Conv2D('convf', l, 576, 1, activation=BNReLU)
-        # s = l.get_shape().as_list()
-        # l = tf.reshape(l, [-1, s[1]*s[2]*s[3]])
-        # ll = tf.split(l, s[1]*s[2], -1)
-        # ll = [FullyConnected('psroi_proj{}'.format(i), l, 20, activation=BNReLU) \
-        #         for i, l in enumerate(ll)]
-        # fc = tf.concat(ll, axis=-1)
-        #
-        # # fc layers
-        # fc = FullyConnected('fc6/L', fc, 128, activation=None)
-        # fc = FullyConnected('fc6/U', fc, 4096, activation=BNReLU)
-        # # fc = Dropout('fc6/Drop', fc, rate=0.25)
-        # fc = FullyConnected('fc7/L', fc, 128, activation=None)
-        # fc = FullyConnected('fc7/U', fc, 4096, activation=BNReLU)
-        # # fc = Dropout('fc7/Drop', fc, rate=0.25)
-        #
-        # logits = FullyConnected('linear', fc, num_classes, use_bias=True)
-
-        # The original implementation
-        l = Conv2D('convf', l, 1280, 1, activation=BNReLU)
-        l = GlobalAvgPooling('poolf', l)
+        # should be 7x7 from this stage, with input size (224, 224)
+        s = l.get_shape().as_list()
+        l = tf.reshape(l, [-1, s[1]*s[2]*s[3]])
+        ll = tf.split(l, s[1]*s[2], -1)
+        ll = [FullyConnected('psroi_proj{}'.format(i), l, 20, activation=BNReLU) \
+                for i, l in enumerate(ll)]
+        fc = tf.concat(ll, axis=-1)
+        # l = Conv2D('psroi_proj', l, 20, 1)
 
         fc = tf.layers.flatten(l)
+
+        # fc layers
+        fc = FullyConnected('fc6/L', fc, 128, activation=None)
+        fc = FullyConnected('fc6/U', fc, 4096, activation=BNReLU)
+        fc = Dropout('fc6/Drop', fc, rate=0.25)
+        fc = FullyConnected('fc7/L', fc, 128, activation=None)
+        fc = FullyConnected('fc7/U', fc, 4096, activation=BNReLU)
+        fc = Dropout('fc7/Drop', fc, rate=0.25)
+
         logits = FullyConnected('linear', fc, num_classes, use_bias=True)
     return logits
 
@@ -205,7 +145,7 @@ class OpenImageModel(_OpenImageModel):
     weight_decay = 4e-5
     data_format = 'NHWC'
 
-    def get_logits(self, image, num_classes=601):
+    def get_logits(self, image, num_classes=1502):
         return _get_logits(image, num_classes)
 
 
@@ -215,7 +155,7 @@ def get_data(name, batch):
     if isTrain:
         augmentors = [
             # use lighter augs if model is too small
-            GoogleNetResize(crop_area_fraction=0.16), #0.49
+            GoogleNetResize(crop_area_fraction=0.36),
             imgaug.RandomOrderAug(
                 [imgaug.BrightnessScale((0.6, 1.4), clip=False),
                  imgaug.Contrast((0.6, 1.4), clip=False),
@@ -245,30 +185,22 @@ def get_data(name, batch):
 
 
 def get_config(model, nr_tower):
-    batch = args.batch
+    batch = TOTAL_BATCH_SIZE // nr_tower
 
     logger.info("Running on {} towers. Batch size per tower: {}".format(nr_tower, batch))
     dataset_train = get_data('train', batch)
     dataset_val = get_data('val', batch)
 
-    num_example = 1280000 if args.dataset == 'imagenet' else 1592088
-    step_size = num_example // (batch * nr_tower)
-    max_iter = int(step_size * 250)
-    # max_iter = 3 * 10**5
+    num_example = 1280000 if args.dataset == 'imagenet' else 1592085
+    step_size = num_example // TOTAL_BATCH_SIZE
+    max_iter = 6 * 10**5
     max_epoch = (max_iter // step_size) + 1
     callbacks = [
         ModelSaver(),
         ScheduledHyperParamSetter('learning_rate',
-                                  [(0, 0.5),]),
-        HyperParamSetterWithFunc('learning_rate',
-                                 lambda e, x: x * 0.975 if e > 0 else x)
+                                  [(0, 0.2), (max_iter, 0)],
+                                  interp='linear', step_based=True),
     ]
-    # callbacks = [
-    #     ModelSaver(),
-    #     ScheduledHyperParamSetter('learning_rate',
-    #                               [(0, 0.1), (max_iter, 0)],
-    #                               interp='linear', step_based=True),
-    # ]
     if args.dataset == 'imagenet':
         infs = [ClassificationError('wrong-top1', 'val-error-top1'),
                 ClassificationError('wrong-top5', 'val-error-top5')]
@@ -287,8 +219,7 @@ def get_config(model, nr_tower):
     # TODO: remove this
     # step_size = 10
 
-    TrainCfg = TrainConfig if not args.resume else AutoResumeTrainConfig
-    return TrainCfg(
+    return TrainConfig(
         model=model,
         dataflow=dataset_train,
         callbacks=callbacks,
@@ -301,13 +232,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--gpu', help='comma separated list of GPU(s) to use.')
     parser.add_argument('--data', help='ILSVRC or OpenImage dataset dir')
-    parser.add_argument('--batch', help='batch size', type=int, default=128)
     # parser.add_argument('-r', '--ratio', type=float, default=0.5, choices=[1., 0.5])
     # parser.add_argument('--group', type=int, default=8, choices=[3, 4, 8],
     #                     help="Number of groups for ShuffleNetV1")
     # parser.add_argument('--v2', action='store_true', help='Use ShuffleNetV2')
     parser.add_argument('--load', help='path to load a model from')
-    parser.add_argument('--resume', action='store_true', help='resume training.')
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--flops', action='store_true', help='print flops and exit')
     parser.add_argument('--dataset', type=str, default='imagenet', choices=['imagenet', 'openimage'],
@@ -323,7 +252,7 @@ if __name__ == '__main__':
     model = ImageNetModel() if args.dataset == 'imagenet' else OpenImageModel()
 
     if args.eval:
-        batch = 192    # something that can run on one gpu
+        batch = 128    # something that can run on one gpu
         ds = get_data('val', batch)
         eval_on_ILSVRC12(model, get_model_loader(args.load), ds)
     elif args.flops:
@@ -347,7 +276,7 @@ if __name__ == '__main__':
         logger.info("TensorFlow counts multiply+add as two flops, however the paper counts them "
                     "as 1 flop because it can be executed in one instruction.")
     else:
-        name = 'ssdnetv1'
+        name = 'PVANETv11.0'
         logger.set_logger_dir(os.path.join('train_log', name))
 
         nr_tower = max(get_num_gpu(), 1)

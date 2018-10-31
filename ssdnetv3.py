@@ -18,7 +18,7 @@ from tensorpack.tfutils.argscope import argscope #, get_arg_scope
 from tensorpack.utils.gpu import get_num_gpu
 from tensorpack.utils import logger
 from tensorpack.models import (
-    Conv2D, Deconv2D, MaxPooling, BatchNorm, BNReLU, LinearWrap, GlobalAvgPooling)
+    Conv2D, Deconv2D, MaxPooling, BatchNorm, BNReLU, LinearWrap, AvgPooling, GlobalAvgPooling)
 
 # from .basemodel import (
 #     maybe_freeze_affine, maybe_reverse_pad, maybe_syncbn_scope, get_bn)
@@ -71,7 +71,7 @@ def DWConv(x, kernel, padding='SAME', stride=1, w_init=None, active=True, data_f
 def LinearBottleneck(x, ich, och, kernel,
                      padding='SAME',
                      stride=1,
-                     active=False,
+                     active=True,
                      t=6,
                      w_init=None):
     '''
@@ -98,9 +98,11 @@ def DownsampleBottleneck(x, ich, och, kernel,
     '''
     downsample linear bottlenet.
     '''
-    out_e = Conv2D('conv_e', x, int(ich*t), 1, activation=BNReLU)
+    out_e = Conv2D('conv_e', x, ich*t, 1, activation=BNReLU)
     out_d = DWConv('conv_d', out_e, kernel, padding, stride, w_init)
     out_m = DWConv('conv_m', out_e, kernel, padding, stride, w_init)
+    # out_m = MaxPooling('pool_d', out_e, kernel_pool, strides=stride, padding='SAME')
+    # out_m *= (kernel_pool**2) // 2
     out = tf.concat([out_d, out_m], axis=-1)
     # if active:
     #     out = Conv2D('conv_p', out, och, 1, activation=BNReLU)
@@ -112,11 +114,12 @@ def DownsampleBottleneck(x, ich, och, kernel,
 
 
 @layer_register(log_shape=True)
-def inception(x, ich, stride, t=3, swap_block=False, w_init=None):
+def inception(x, ich, stride, t=6, swap_block=False, w_init=None):
     '''
     ssdnet inception layer.
     '''
     k = 4 if stride == 2 else 3
+
     och = ich * 2
     if stride == 1:
         oi = LinearBottleneck('conv1', x, och, och, k, stride=stride, t=t, w_init=w_init)
@@ -124,7 +127,7 @@ def inception(x, ich, stride, t=3, swap_block=False, w_init=None):
         oi = DownsampleBottleneck('conv1', x, ich, och, k, stride=stride, t=t, w_init=w_init)
     oi = tf.split(oi, 2, axis=-1)
     o1 = oi[0]
-    o2 = oi[1] + LinearBottleneck('conv2', oi[1], ich, ich, 5, t=t, w_init=w_init, active=False)
+    o2 = oi[1] + LinearBottleneck('conv2', oi[1], ich, ich, 5, t=t, w_init=w_init, active=True)
     # o3 = LinearBottleneck('conv3', o2, ich//2, ich//2, 5, t=t, w_init=w_init)
 
     if not swap_block:
@@ -142,16 +145,16 @@ def inception(x, ich, stride, t=3, swap_block=False, w_init=None):
 def _get_logits(image, num_classes=1000, mu=1.0):
     with ssdnet_argscope():
         l = image #tf.transpose(image, perm=[0, 2, 3, 1])
-
-        # conv1
         ch1 = int(round(12 * mu))
+        # conv1
         l = Conv2D('conv1', l, ch1, 4, strides=2, activation=None, padding='SAME')
         with tf.variable_scope('conv1'):
             l = BNReLU(tf.concat([l, -l], -1))
-
         # conv2
-        ch2 = ch1 * 2
-        l = DownsampleBottleneck('conv2', l, ch2, ch2, 4, t=1)
+        ch2 = ch1*2 # base=24
+        l = DWConv('conv2', l, 4, padding='SAME', stride=2, active=False)
+        # conv3
+        l = LinearBottleneck('conv3', l, ch2, ch2, 3, t=2)
 
         # inception layers
         ich0 = ch2 # base=24
@@ -302,10 +305,6 @@ if __name__ == '__main__':
     parser.add_argument('--gpu', help='comma separated list of GPU(s) to use.')
     parser.add_argument('--data', help='ILSVRC or OpenImage dataset dir')
     parser.add_argument('--batch', help='batch size', type=int, default=128)
-    # parser.add_argument('-r', '--ratio', type=float, default=0.5, choices=[1., 0.5])
-    # parser.add_argument('--group', type=int, default=8, choices=[3, 4, 8],
-    #                     help="Number of groups for ShuffleNetV1")
-    # parser.add_argument('--v2', action='store_true', help='Use ShuffleNetV2')
     parser.add_argument('--load', help='path to load a model from')
     parser.add_argument('--resume', action='store_true', help='resume training.')
     parser.add_argument('--eval', action='store_true')
@@ -316,9 +315,6 @@ if __name__ == '__main__':
 
     if args.gpu:
         os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
-
-    # if args.v2 and args.group != parser.get_default('group'):
-    #     logger.error("group= is not used in ShuffleNetV2!")
 
     model = ImageNetModel() if args.dataset == 'imagenet' else OpenImageModel()
 
@@ -347,7 +343,7 @@ if __name__ == '__main__':
         logger.info("TensorFlow counts multiply+add as two flops, however the paper counts them "
                     "as 1 flop because it can be executed in one instruction.")
     else:
-        name = 'ssdnetv1'
+        name = 'ssdnetv3'
         logger.set_logger_dir(os.path.join('train_log', name))
 
         nr_tower = max(get_num_gpu(), 1)

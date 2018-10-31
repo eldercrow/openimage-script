@@ -98,7 +98,7 @@ def DownsampleBottleneck(x, ich, och, kernel,
     '''
     downsample linear bottlenet.
     '''
-    out_e = Conv2D('conv_e', x, int(ich*t), 1, activation=BNReLU)
+    out_e = Conv2D('conv_e', x, ich*t, 1, activation=BNReLU)
     out_d = DWConv('conv_d', out_e, kernel, padding, stride, w_init)
     out_m = DWConv('conv_m', out_e, kernel, padding, stride, w_init)
     out = tf.concat([out_d, out_m], axis=-1)
@@ -112,7 +112,7 @@ def DownsampleBottleneck(x, ich, och, kernel,
 
 
 @layer_register(log_shape=True)
-def inception(x, ich, stride, t=3, swap_block=False, w_init=None):
+def inception(x, ich, stride, t=6, swap_block=False, w_init=None):
     '''
     ssdnet inception layer.
     '''
@@ -124,7 +124,7 @@ def inception(x, ich, stride, t=3, swap_block=False, w_init=None):
         oi = DownsampleBottleneck('conv1', x, ich, och, k, stride=stride, t=t, w_init=w_init)
     oi = tf.split(oi, 2, axis=-1)
     o1 = oi[0]
-    o2 = oi[1] + LinearBottleneck('conv2', oi[1], ich, ich, 5, t=t, w_init=w_init, active=False)
+    o2 = oi[1] + LinearBottleneck('conv2', oi[1], ich, ich, 5, t=t, w_init=w_init, active=True)
     # o3 = LinearBottleneck('conv3', o2, ich//2, ich//2, 5, t=t, w_init=w_init)
 
     if not swap_block:
@@ -142,16 +142,16 @@ def inception(x, ich, stride, t=3, swap_block=False, w_init=None):
 def _get_logits(image, num_classes=1000, mu=1.0):
     with ssdnet_argscope():
         l = image #tf.transpose(image, perm=[0, 2, 3, 1])
-
-        # conv1
         ch1 = int(round(12 * mu))
+        # conv1
         l = Conv2D('conv1', l, ch1, 4, strides=2, activation=None, padding='SAME')
         with tf.variable_scope('conv1'):
             l = BNReLU(tf.concat([l, -l], -1))
-
-        # conv2
-        ch2 = ch1 * 2
-        l = DownsampleBottleneck('conv2', l, ch2, ch2, 4, t=1)
+        # pool2
+        l = MaxPooling('pool2', l, 2, strides=2, padding='SAME')
+        ch2 = ch1*2 # base=24
+        # conv3
+        l = LinearBottleneck('conv3', l, ch2, ch2, 3, t=2)
 
         # inception layers
         ich0 = ch2 # base=24
@@ -253,13 +253,13 @@ def get_config(model, nr_tower):
 
     num_example = 1280000 if args.dataset == 'imagenet' else 1592088
     step_size = num_example // (batch * nr_tower)
-    max_iter = int(step_size * 250)
+    max_iter = int(step_size * 50) #250)
     # max_iter = 3 * 10**5
     max_epoch = (max_iter // step_size) + 1
     callbacks = [
         ModelSaver(),
         ScheduledHyperParamSetter('learning_rate',
-                                  [(0, 0.5),]),
+                                  [(0, np.sqrt(1e-05))]), #0.5),]),
         HyperParamSetterWithFunc('learning_rate',
                                  lambda e, x: x * 0.975 if e > 0 else x)
     ]
@@ -347,7 +347,7 @@ if __name__ == '__main__':
         logger.info("TensorFlow counts multiply+add as two flops, however the paper counts them "
                     "as 1 flop because it can be executed in one instruction.")
     else:
-        name = 'ssdnetv1'
+        name = 'ssdnetv2'
         logger.set_logger_dir(os.path.join('train_log', name))
 
         nr_tower = max(get_num_gpu(), 1)
