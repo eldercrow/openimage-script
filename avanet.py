@@ -32,7 +32,7 @@ from imagenet_utils import ImageNetModel as _ImageNetModel
 from openimage_utils import get_openimage_dataflow
 from openimage_utils import OpenImageModel as _OpenImageModel
 
-TOTAL_BATCH_SIZE = 512
+# TOTAL_BATCH_SIZE = 512
 
 
 @contextmanager
@@ -110,25 +110,30 @@ def _get_logits(image, num_classes=1000):
                 else:
                     l = inception(name, l, ch, t, ndiv)
 
-        # should be 7x7 from this stage, with input size (224, 224)
-        s = l.get_shape().as_list()
-        l = tf.reshape(l, [-1, s[1]*s[2]*s[3]])
-        ll = tf.split(l, s[1]*s[2], -1)
-        ll = [FullyConnected('psroi_proj{}'.format(i), l, 20, activation=BNReLU) \
-                for i, l in enumerate(ll)]
-        fc = tf.concat(ll, axis=-1)
-        # l = Conv2D('psroi_proj', l, 20, 1)
+        # # should be 7x7 at this stage, with input size (224, 224)
+        # l = Conv2D('convf', l, 576, 1, activation=BNReLU)
+        # s = l.get_shape().as_list()
+        # l = tf.reshape(l, [-1, s[1]*s[2]*s[3]])
+        # ll = tf.split(l, s[1]*s[2], -1)
+        # ll = [FullyConnected('psroi_proj{}'.format(i), l, 20, activation=BNReLU) \
+        #         for i, l in enumerate(ll)]
+        # fc = tf.concat(ll, axis=-1)
+        #
+        # # fc layers
+        # fc = FullyConnected('fc6/L', fc, 128, activation=None)
+        # fc = FullyConnected('fc6/U', fc, 4096, activation=BNReLU)
+        # # fc = Dropout('fc6/Drop', fc, rate=0.25)
+        # fc = FullyConnected('fc7/L', fc, 128, activation=None)
+        # fc = FullyConnected('fc7/U', fc, 4096, activation=BNReLU)
+        # # fc = Dropout('fc7/Drop', fc, rate=0.25)
+        #
+        # logits = FullyConnected('linear', fc, num_classes, use_bias=True)
+
+        # The original implementation
+        l = Conv2D('convf', l, 1280, 1, activation=BNReLU)
+        l = GlobalAvgPooling('poolf', l)
 
         fc = tf.layers.flatten(l)
-
-        # fc layers
-        fc = FullyConnected('fc6/L', fc, 128, activation=None)
-        fc = FullyConnected('fc6/U', fc, 4096, activation=BNReLU)
-        fc = Dropout('fc6/Drop', fc, rate=0.25)
-        fc = FullyConnected('fc7/L', fc, 128, activation=None)
-        fc = FullyConnected('fc7/U', fc, 4096, activation=BNReLU)
-        fc = Dropout('fc7/Drop', fc, rate=0.25)
-
         logits = FullyConnected('linear', fc, num_classes, use_bias=True)
     return logits
 
@@ -149,7 +154,7 @@ class OpenImageModel(_OpenImageModel):
         return _get_logits(image, num_classes)
 
 
-def get_data(name, batch):
+def get_data(name, batch, parallel=6):
     isTrain = name == 'train'
 
     if isTrain:
@@ -178,29 +183,37 @@ def get_data(name, batch):
             imgaug.CenterCrop((224, 224)),
         ]
 
-    df = get_imagenet_dataflow(args.data, name, batch, augmentors) \
+    df = get_imagenet_dataflow(args.data, name, batch, augmentors, parallel) \
             if args.dataset == 'imagenet' else \
             get_openimage_dataflow(args.data, name, batch, augmentors)
     return df
 
 
 def get_config(model, nr_tower):
-    batch = TOTAL_BATCH_SIZE // nr_tower
+    batch = args.batch
+    parallel = args.parallel
 
     logger.info("Running on {} towers. Batch size per tower: {}".format(nr_tower, batch))
-    dataset_train = get_data('train', batch)
-    dataset_val = get_data('val', batch)
+    dataset_train = get_data('train', batch, parallel)
+    dataset_val = get_data('val', batch, parallel)
 
     num_example = 1280000 if args.dataset == 'imagenet' else 1592085
-    step_size = num_example // TOTAL_BATCH_SIZE
-    max_iter = 6 * 10**5
+    step_size = num_example // (batch * nr_tower)
+    max_iter = int(step_size * 250)
     max_epoch = (max_iter // step_size) + 1
     callbacks = [
         ModelSaver(),
         ScheduledHyperParamSetter('learning_rate',
-                                  [(0, 0.2), (max_iter, 0)],
-                                  interp='linear', step_based=True),
+                                  [(0, 0.5),]),
+        HyperParamSetterWithFunc('learning_rate',
+                                 lambda e, x: x * 0.975 if e > 0 else x)
     ]
+    # callbacks = [
+    #     ModelSaver(),
+    #     ScheduledHyperParamSetter('learning_rate',
+    #                               [(0, 0.2), (max_iter, 0)],
+    #                               interp='linear', step_based=True),
+    # ]
     if args.dataset == 'imagenet':
         infs = [ClassificationError('wrong-top1', 'val-error-top1'),
                 ClassificationError('wrong-top5', 'val-error-top5')]
@@ -232,6 +245,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--gpu', help='comma separated list of GPU(s) to use.')
     parser.add_argument('--data', help='ILSVRC or OpenImage dataset dir')
+    parser.add_argument('--batch', help='batch size', type=int, default=128)
+    parser.add_argument('--parallel', help='number of cpu workers prefetching data', type=int, default=6)
     # parser.add_argument('-r', '--ratio', type=float, default=0.5, choices=[1., 0.5])
     # parser.add_argument('--group', type=int, default=8, choices=[3, 4, 8],
     #                     help="Number of groups for ShuffleNetV1")
@@ -276,7 +291,7 @@ if __name__ == '__main__':
         logger.info("TensorFlow counts multiply+add as two flops, however the paper counts them "
                     "as 1 flop because it can be executed in one instruction.")
     else:
-        name = 'PVANETv11.0'
+        name = 'avanet'
         logger.set_logger_dir(os.path.join('train_log', name))
 
         nr_tower = max(get_num_gpu(), 1)

@@ -95,7 +95,7 @@ def get_imagenet_dataflow(
     assert datadir is not None
     assert isinstance(augmentors, list)
     isTrain = name == 'train'
-    if parallel is None:
+    if parallel is None or parallel <= 0:
         parallel = min(40, multiprocessing.cpu_count() - 2)  # assuming hyperthreading
         # parallel = min(40, multiprocessing.cpu_count() // 2)  # assuming hyperthreading
     if isTrain:
