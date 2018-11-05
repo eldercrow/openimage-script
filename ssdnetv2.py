@@ -38,9 +38,35 @@ from openimage_utils import OpenImageModel as _OpenImageModel
 @contextmanager
 def ssdnet_argscope():
     with argscope([Conv2D, MaxPooling, BatchNorm, GlobalAvgPooling, DWConv], data_format='NHWC'), \
-            argscope([Conv2D, FullyConnected], use_bias=False), \
-            argscope([BatchNorm], momentum=0.999):
+            argscope([Conv2D, FullyConnected], use_bias=False):
         yield
+
+
+@layer_register(log_shape=True)
+def DropBlock(x, keep_prob=None, block_size=5, data_format='NHWC'):
+    '''
+    DropBlock
+    '''
+    if keep_prob is None or not get_current_tower_context().is_training:
+        return x
+
+    assert data_format in ('NHWC', 'channels_last')
+    feat_size = x.get_shape().as_list()[1]
+
+    f2 = feat_size * feat_size
+    b2 = block_size * block_size
+    r = (feat_size - block_size + 1)
+    r2 = r*r
+    gamma = (1. - keep_prob) * f2 / b2 / r2
+    k = [1, block_size, block_size, 1]
+
+    mask = tf.less(tf.random_uniform(tf.shape(x), 0, 1), gamma)
+    mask = tf.cast(mask, dtype=x.dtype)
+    mask = tf.nn.max_pool(mask, ksize=k, strides=[1, 1, 1, 1], padding='SAME')
+    drop_mask = (1. - mask) * (1. / keep_prob)
+    drop_mask = tf.stop_gradient(drop_mask, name='drop_mask')
+    # drop_mask = tf.Print(drop_mask, [tf.reduce_sum(drop_mask)])
+    return tf.multiply(x, drop_mask, name='dropped')
 
 
 @layer_register(log_shape=True)
@@ -72,16 +98,13 @@ def LinearBottleneck(x, ich, och, kernel,
                      padding='SAME',
                      stride=1,
                      active=False,
-                     t=6,
+                     t=3,
                      w_init=None):
     '''
     mobilenetv2 linear bottlenet.
     '''
     out = Conv2D('conv_e', x, int(ich*t), 1, activation=BNReLU)
     out = DWConv('conv_d', out, kernel, padding, stride, w_init, active)
-    # if active:
-    #     out = Conv2D('conv_p', out, och, 1, activation=BNReLU)
-    # else:
     out = Conv2D('conv_p', out, och, 1, activation=None)
     with tf.variable_scope('conv_p'):
         out = BatchNorm('bn', out)
@@ -93,18 +116,15 @@ def DownsampleBottleneck(x, ich, och, kernel,
                          padding='SAME',
                          stride=2,
                          active=False,
-                         t=6,
+                         t=3,
                          w_init=None):
     '''
     downsample linear bottlenet.
     '''
     out_e = Conv2D('conv_e', x, ich*t, 1, activation=BNReLU)
-    out_d = DWConv('conv_d', out_e, kernel, padding, stride, w_init)
-    out_m = DWConv('conv_m', out_e, kernel, padding, stride, w_init)
+    out_d = DWConv('conv_d', out_e, kernel, padding, stride, w_init, active)
+    out_m = DWConv('conv_m', out_e, kernel, padding, stride, w_init, active)
     out = tf.concat([out_d, out_m], axis=-1)
-    # if active:
-    #     out = Conv2D('conv_p', out, och, 1, activation=BNReLU)
-    # else:
     out = Conv2D('conv_p', out, och, 1, activation=None)
     with tf.variable_scope('conv_p'):
         out = BatchNorm('bn', out)
@@ -112,19 +132,19 @@ def DownsampleBottleneck(x, ich, och, kernel,
 
 
 @layer_register(log_shape=True)
-def inception(x, ich, stride, t=6, swap_block=False, w_init=None):
+def inception(x, ich, stride, t=3, swap_block=False, w_init=None, active=False):
     '''
     ssdnet inception layer.
     '''
     k = 4 if stride == 2 else 3
     och = ich * 2
     if stride == 1:
-        oi = LinearBottleneck('conv1', x, och, och, k, stride=stride, t=t, w_init=w_init)
+        oi = LinearBottleneck('conv1', x, och, och, k, stride=stride, t=t, w_init=w_init, active=active)
     else:
-        oi = DownsampleBottleneck('conv1', x, ich, och, k, stride=stride, t=t, w_init=w_init)
+        oi = DownsampleBottleneck('conv1', x, ich, och, k, stride=stride, t=t, w_init=w_init, active=active)
     oi = tf.split(oi, 2, axis=-1)
     o1 = oi[0]
-    o2 = oi[1] + LinearBottleneck('conv2', oi[1], ich, ich, 5, t=t, w_init=w_init, active=True)
+    o2 = oi[1] + LinearBottleneck('conv2', oi[1], ich, ich, 5, t=t, w_init=w_init, active=active)
     # o3 = LinearBottleneck('conv3', o2, ich//2, ich//2, 5, t=t, w_init=w_init)
 
     if not swap_block:
@@ -141,6 +161,14 @@ def inception(x, ich, stride, t=6, swap_block=False, w_init=None):
 
 def _get_logits(image, num_classes=1000, mu=1.0):
     with ssdnet_argscope():
+        # dropblock
+        if get_current_tower_context().is_training:
+            keep_prob = tf.get_variable('keep_prob', (),
+                                        dtype=tf.float32,
+                                        trainable=False)
+        else:
+            keep_prob = None
+
         l = image #tf.transpose(image, perm=[0, 2, 3, 1])
         ch1 = int(round(12 * mu))
         # conv1
@@ -151,10 +179,10 @@ def _get_logits(image, num_classes=1000, mu=1.0):
         l = MaxPooling('pool2', l, 2, strides=2, padding='SAME')
         ch2 = ch1*2 # base=24
         # conv3
-        l = LinearBottleneck('conv3', l, ch2, ch2, 3, t=2)
+        l = LinearBottleneck('conv3', l, ch2, ch2, 3, t=2, active=False)
 
         # inception layers
-        ich0 = ch2 # base=24
+        ich0 = int(round(24*mu)) # base=24
         ichs = [int(round(ich0*c)) for c in (1, 2, 4)]
         ochs = [i*2 for i in ichs]
         iters = [2, 4, 2]
@@ -163,8 +191,9 @@ def _get_logits(image, num_classes=1000, mu=1.0):
             with tf.variable_scope('inc{}'.format(ii)):
                 for jj in range(it):
                     stride = 2 if jj == 0 else 1
-                    l = inception('{}'.format(jj), l, ich, stride, t, (jj%2==1))
-
+                    l = inception('{}'.format(jj), l, ich, stride, t, (jj%2==1), active=False)
+                    if ii in (0, 1):
+                        l = DropBlock('{}/drop'.format(jj), l, keep_prob, block_size=7)
         # # should be 7x7 at this stage, with input size (224, 224)
         # l = Conv2D('convf', l, 576, 1, activation=BNReLU)
         # s = l.get_shape().as_list()
@@ -253,15 +282,18 @@ def get_config(model, nr_tower):
 
     num_example = 1280000 if args.dataset == 'imagenet' else 1592088
     step_size = num_example // (batch * nr_tower)
-    max_iter = int(step_size * 50) #250)
+    max_iter = int(step_size * 250)
     # max_iter = 3 * 10**5
     max_epoch = (max_iter // step_size) + 1
     callbacks = [
         ModelSaver(),
         ScheduledHyperParamSetter('learning_rate',
-                                  [(0, np.sqrt(1e-05))]), #0.5),]),
+                                  [(0, 0.4),]),
         HyperParamSetterWithFunc('learning_rate',
-                                 lambda e, x: x * 0.975 if e > 0 else x)
+                                 lambda e, x: x * 0.975 if e > 0 else x),
+        ScheduledHyperParamSetter('keep_prob',
+                                  [(0, 1.0), (max_epoch, 0.9)],
+                                  interp='linear')
     ]
     # callbacks = [
     #     ModelSaver(),

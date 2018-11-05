@@ -7,6 +7,8 @@ import os
 import numpy as np
 import tensorflow as tf
 
+from collections import deque
+
 from contextlib import contextmanager
 
 from tensorpack import *
@@ -43,44 +45,79 @@ def pvanet_argscope():
 
 
 @layer_register(log_shape=True)
-def inception(data, ch, t, ndiv):
+def inception(data, bch, roll_idx, num_block=3, active_first=True):
     '''
     '''
-    ich = int(ch * t)
-    bch = ich // ndiv
-    ch1 = int(bch * (ndiv - 1))
-    ch3 = bch
-    # ch2 = ch3 // 2
+    assert num_block in (2, 3)
+    ch1 = bch
+    ch3 = ch1 // 2
+    ch5 = ch3 // 2
 
-    l1 = Conv2D('conv1', data, ch1, 1, activation=BNReLU)
-    l3 = Conv2D('conv3/1', data, ch3, 1, padding='SAME', activation=BNReLU)
-    l3 = Conv2D('conv3/2', l3, ch3, 3, padding='SAME', activation=BNReLU)
+    l0 = tf.nn.relu(data) if active_first else data
+    ll = []
 
-    lc = tf.concat([l1, l3], axis=-1)
-    lc = Conv2D('convc', lc, ch, 1, activation=None)
-    with tf.variable_scope('convc'):
-        lc = BatchNorm('bn', lc)
-    return tf.add(data, lc, name='out')
+    # 1x1
+    l1 = Conv2D('conv1', l0, ch1, 1, activation=None)
+    l1 = BatchNorm('conv1/bn', l1)
+    ll.append(l1)
+    # 3x3
+    l3 = Conv2D('conv3/1', l0, ch3, 1, padding='SAME', activation=BNReLU)
+    # l3 = BatchNorm('conv3/1/bn', l3)
+    l3 = Conv2D('conv3/2', l3, ch1, 3, padding='SAME', activation=None)
+    l3 = BatchNorm('conv3/2/bn', l3)
+    ll.append(l3)
+    # 5x5
+    if num_block == 3:
+        l5 = Conv2D('conv5/1', l0, ch5, 1, padding='SAME', activation=BNReLU)
+        # l5 = BatchNorm('conv5/1/bn', l5)
+        l5 = Conv2D('conv5/2', l5, ch1, 5, padding='SAME', activation=None)
+        l5 = BatchNorm('conv5/2/bn', l5)
+        ll.append(l5)
+    # concat
+    lc = deque(ll).rotate(roll_idx)
+    lc = tf.concat(ll, axis=-1)
+    # residual, if applicable
+    ich = data.get_shape().as_list()[-1]
+    och = lc.get_shape().as_list()[-1]
+    if ich == och:
+        out = tf.add(data, lc, name='out')
+    else:
+        out = lc
+    return out
+
 
 @layer_register(log_shape=True)
-def downception(data, ch, t, ndiv):
+def downception(data, bch, num_block=3, active_first=True):
     '''
     '''
-    ich = int(ch * t)
-    bch = ich // ndiv
-    ch1 = int(bch * (ndiv - 1))
-    ch3 = bch
-    ch2 = ch3 // 2
+    assert num_block in (2, 3)
+    ch1 = bch
+    ch3 = ch1 // 2
+    ch5 = ch3 // 2
 
-    l1 = Conv2D('conv1', data, ch1, 1, activation=BNReLU)
-    l1 = MaxPooling('pool1', l1, 2, strides=2, padding='SAME')
-    l3 = Conv2D('conv3/1', data, ch2, 1, padding='SAME', activation=BNReLU)
-    l3 = Conv2D('conv3/2', l3, ch3, 4, strides=2, padding='SAME', activation=BNReLU)
+    l0 = tf.nn.relu(data) if active_first else data
+    ll = []
 
-    lc = tf.concat([l1, l3], axis=-1)
-    lc = Conv2D('convc', lc, ch, 1, activation=None)
-    with tf.variable_scope('convc'):
-        lc = BatchNorm('bn', lc)
+    # 1x1
+    l1 = MaxPooling('pool1', l0, 2, strides=2, padding='SAME')
+    l1 = Conv2D('conv1', l1, ch1, 1, activation=None)
+    l1 = BatchNorm('conv1/bn', l1)
+    ll.append(l1)
+    # 3x3
+    l3 = Conv2D('conv3/1', l0, ch3, 1, padding='SAME', activation=BNReLU)
+    l3 = Conv2D('conv3/2', l3, ch1, 4, strides=2, padding='SAME', activation=None)
+    l3 = BatchNorm('conv3/2/bn', l3)
+    ll.append(l3)
+    # 5x5
+    if num_block == 3:
+        l5 = Conv2D('conv5/1', l0, ch3, 1, padding='SAME', activation=BNReLU)
+        # l5 = BatchNorm('conv5/1/bn', l5)
+        l5 = Conv2D('conv5/2', l5, ch3, 4, strides=2, padding='SAME', activation=BNReLU)
+        l5 = Conv2D('conv5/3', l5, ch1, 3, padding='SAME', activation=None)
+        l5 = BatchNorm('conv5/3/bn', l5)
+        ll.append(l5)
+
+    lc = tf.concat(ll, axis=-1)
     return lc
 
 
@@ -91,24 +128,25 @@ def _get_logits(image, num_classes=1000):
         l = Conv2D('conv1', l, 12, 4, strides=2, activation=None, padding='SAME')
         with tf.variable_scope('conv1'):
             l = BNReLU(tf.concat([l, -l], -1))
+        l = MaxPooling('pool1', l, 2, strides=2, padding='SAME')
         # conv2
-        l = Conv2D('conv2', l, 48, 1, activation=BNReLU)
-        l = MaxPooling('pool2', l, 2, strides=2, padding='SAME')
-        # conv3
+        l = inception('conv2', l, 24, roll_idx=0, num_block=2, active_first=False)
         l = Conv2D('conv3', l, 24, 1, activation=None)
         l = BatchNorm('conv3/bn', l)
 
-        channels = [48, 96, 192]
+        channels = [96, 168, 288]
         iters = [2, 6, 3]
-        ndivs = [4, 6, 6]
-        mults = [2, 3, 3]
-        for ii, (ch, it, ndiv, t) in enumerate(zip(channels, iters, ndivs, mults)):
+        ndivs = [2, 3, 3]
+        # mults = [2, 2, 2]
+        # for ii, (ch, it, ndiv, t) in enumerate(zip(channels, iters, ndivs, mults)):
+        for ii, (ch, it, ndiv) in enumerate(zip(channels, iters, ndivs)):
             for jj in range(it):
                 name = 'inc{}/{}'.format(ii+1, jj+1)
+                # k = 5 if (jj % 4 == 3) else 3
                 if jj == 0:
-                    l = downception(name, l, ch, t, ndiv)
+                    l = downception(name, l, ch//ndiv, ndiv)
                 else:
-                    l = inception(name, l, ch, t, ndiv)
+                    l = inception(name, l, ch//ndiv, jj, ndiv)
 
         # # should be 7x7 at this stage, with input size (224, 224)
         # l = Conv2D('convf', l, 576, 1, activation=BNReLU)
@@ -160,7 +198,7 @@ def get_data(name, batch, parallel=6):
     if isTrain:
         augmentors = [
             # use lighter augs if model is too small
-            GoogleNetResize(crop_area_fraction=0.36),
+            GoogleNetResize(crop_area_fraction=0.16),
             imgaug.RandomOrderAug(
                 [imgaug.BrightnessScale((0.6, 1.4), clip=False),
                  imgaug.Contrast((0.6, 1.4), clip=False),
@@ -199,7 +237,7 @@ def get_config(model, nr_tower):
 
     num_example = 1280000 if args.dataset == 'imagenet' else 1592085
     step_size = num_example // (batch * nr_tower)
-    max_iter = int(step_size * 250)
+    max_iter = int(step_size * 300)
     max_epoch = (max_iter // step_size) + 1
     callbacks = [
         ModelSaver(),
@@ -246,7 +284,7 @@ if __name__ == '__main__':
     parser.add_argument('--gpu', help='comma separated list of GPU(s) to use.')
     parser.add_argument('--data', help='ILSVRC or OpenImage dataset dir')
     parser.add_argument('--batch', help='batch size', type=int, default=128)
-    parser.add_argument('--parallel', help='number of cpu workers prefetching data', type=int, default=6)
+    parser.add_argument('--parallel', help='number of cpu workers prefetching data', type=int, default=0)
     # parser.add_argument('-r', '--ratio', type=float, default=0.5, choices=[1., 0.5])
     # parser.add_argument('--group', type=int, default=8, choices=[3, 4, 8],
     #                     help="Number of groups for ShuffleNetV1")
