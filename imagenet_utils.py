@@ -50,32 +50,29 @@ class GoogleNetResize(imgaug.ImageAugmentor):
         return out
 
 
-def fbresnet_augmentor(isTrain):
+def fbresnet_augmentor(isTrain, aug_level=2, target_shape=224, crop_area_fraction=0.08):
     """
     Augmentor used in fb.resnet.torch, for BGR images in range [0,255].
     """
     if isTrain:
-        augmentors = [
-            GoogleNetResize(),
-            # It's OK to remove the following augs if your CPU is not fast enough.
-            # Removing brightness/contrast/saturation does not have a significant effect on accuracy.
-            # Removing lighting leads to a tiny drop in accuracy.
-            imgaug.RandomOrderAug(
-                [imgaug.BrightnessScale((0.6, 1.4), clip=False),
-                 imgaug.Contrast((0.6, 1.4), clip=False),
-                 imgaug.Saturation(0.4, rgb=False),
-                 # rgb-bgr conversion for the constants copied from fb.resnet.torch
-                 imgaug.Lighting(0.1,
-                                 eigval=np.asarray(
-                                     [0.2175, 0.0188, 0.0045][::-1]) * 255.0,
-                                 eigvec=np.array(
-                                     [[-0.5675, 0.7192, 0.4009],
-                                      [-0.5808, -0.0045, -0.8140],
-                                      [-0.5836, -0.6948, 0.4203]],
-                                     dtype='float32')[::-1, ::-1]
-                                 )]),
-            imgaug.Flip(horiz=True),
-        ]
+        augmentors = [imgaug.Flip(horiz=True),]
+        if aug_level > 0:
+            augmentors.append(GoogleNetResize(crop_area_fraction=crop_area_fraction,
+                                              target_shape=target_shape))
+        if aug_level > 1:
+            baug = imgaug.BrightnessScale((0.6, 1.4), clip=False)
+            caug = imgaug.Contrast((0.6, 1.4), clip=False)
+            saug = imgaug.Saturation(0.4, rgb=False)
+            laug = imgaug.Lighting(0.1,
+                                   # rgb-bgr conversion for the constants copied from fb.resnet.torch
+                                   eigval=np.asarray( [0.2175, 0.0188, 0.0045][::-1]) * 255.0,
+                                   eigvec=np.array([[-0.5675, 0.7192, 0.4009],
+                                                    [-0.5808, -0.0045, -0.8140],
+                                                    [-0.5836, -0.6948, 0.4203]],
+                                                    dtype='float32')[::-1, ::-1])
+
+            coloraug = imgaug.RandomOrderAug([baug, caug, saug, laug])
+            augmentors.append(coloraug)
     else:
         augmentors = [
             imgaug.ResizeShortestEdge(256, cv2.INTER_CUBIC),
