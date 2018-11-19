@@ -6,6 +6,7 @@ import cv2
 import os
 import numpy as np
 import tensorflow as tf
+from functools import partial
 
 from collections import deque
 
@@ -38,140 +39,141 @@ from openimage_utils import OpenImageModel as _OpenImageModel
 
 
 @contextmanager
-def pvanet_argscope():
+def avanet_argscope():
     with argscope([Conv2D, MaxPooling, BatchNorm, GlobalAvgPooling], data_format='NHWC'), \
             argscope([Conv2D, FullyConnected], use_bias=False):
         yield
 
 
 @layer_register(log_shape=True)
-def inception(data, bch, roll_idx, num_block=3, active_first=True):
+def DropBlock(x, keep_prob=None, block_size=5, drop_mult=1.0, data_format='NHWC'):
+    '''
+    DropBlock
+    '''
+    if keep_prob is None or not get_current_tower_context().is_training:
+        return x
+
+    drop_prob = (1.0 - keep_prob) * drop_mult
+
+    assert data_format in ('NHWC', 'channels_last')
+    feat_size = x.get_shape().as_list()[1]
+    N = tf.to_float(tf.size(x))
+
+    f2 = feat_size * feat_size
+    b2 = block_size * block_size
+    r = (feat_size - block_size + 1)
+    r2 = r*r
+    gamma = drop_prob * f2 / b2 / r2
+    k = [1, block_size, block_size, 1]
+
+    mask = tf.less(tf.random_uniform(tf.shape(x), 0, 1), gamma)
+    mask = tf.cast(mask, dtype=x.dtype)
+    mask = tf.nn.max_pool(mask, ksize=k, strides=[1, 1, 1, 1], padding='SAME')
+    drop_mask = (1. - mask)
+    drop_mask *= (N / tf.reduce_sum(drop_mask))
+    drop_mask = tf.stop_gradient(drop_mask, name='drop_mask')
+    return tf.multiply(x, drop_mask, name='dropped')
+
+
+@layer_register(log_shape=True)
+def inception(data, ch, ch3, kernel=3, residual=True):
     '''
     '''
-    assert num_block in (2, 3)
-    ch1 = bch
-    ch3 = ch1 // 2
-    ch5 = ch3 // 2
-
-    l0 = tf.nn.relu(data) if active_first else data
-    ll = []
-
+    ch0 = int(ch * 2)
+    ch1 = ch0 - ch3
     # 1x1
-    l1 = Conv2D('conv1', l0, ch1, 1, activation=None)
-    l1 = BatchNorm('conv1/bn', l1)
-    ll.append(l1)
+    l0 = Conv2D('conv1', data, ch0, 1, activation=BNReLU)
+    # split to l1 and l3
+    l1, l3 = tf.split(l0, [ch1, ch3], axis=-1)
     # 3x3
-    l3 = Conv2D('conv3/1', l0, ch3, 1, padding='SAME', activation=BNReLU)
-    # l3 = BatchNorm('conv3/1/bn', l3)
-    l3 = Conv2D('conv3/2', l3, ch1, 3, padding='SAME', activation=None)
-    l3 = BatchNorm('conv3/2/bn', l3)
-    ll.append(l3)
-    # 5x5
-    if num_block == 3:
-        l5 = Conv2D('conv5/1', l0, ch5, 1, padding='SAME', activation=BNReLU)
-        # l5 = BatchNorm('conv5/1/bn', l5)
-        l5 = Conv2D('conv5/2', l5, ch1, 5, padding='SAME', activation=None)
-        l5 = BatchNorm('conv5/2/bn', l5)
-        ll.append(l5)
+    l3 = Conv2D('conv3', l3, ch3, kernel, padding='SAME', activation=BNReLU)
     # concat
-    lc = deque(ll).rotate(roll_idx)
-    lc = tf.concat(ll, axis=-1)
-    # residual, if applicable
-    ich = data.get_shape().as_list()[-1]
-    och = lc.get_shape().as_list()[-1]
-    if ich == och:
-        out = tf.add(data, lc, name='out')
-    else:
-        out = lc
+    lc = tf.concat([l1, l3], axis=-1)
+    out = Conv2D('convc', lc, ch, 1, activation=None)
+    out = BatchNorm('convc/bn', out)
+    # residual
+    if residual:
+        out = tf.add(data, out, name='out')
     return out
 
 
 @layer_register(log_shape=True)
-def downception(data, bch, num_block=3, active_first=True):
+def downception(data, ch, ch3, residual=True):
     '''
     '''
-    assert num_block in (2, 3)
-    ch1 = bch
-    ch3 = ch1 // 2
-    ch5 = ch3 // 2
-
-    l0 = tf.nn.relu(data) if active_first else data
-    ll = []
-
-    # 1x1
-    l1 = MaxPooling('pool1', l0, 2, strides=2, padding='SAME')
-    l1 = Conv2D('conv1', l1, ch1, 1, activation=None)
-    l1 = BatchNorm('conv1/bn', l1)
-    ll.append(l1)
+    ch0 = int(ch * 2)
+    ch1 = ch0 - ch3
+    # downsample
+    data = Conv2D('convd', data, ch0, 2, strides=2, activation=None)
+    data = BatchNorm('convd/bn', data)
+    l0 = tf.nn.relu(data)
+    # split to l1 and l3
+    l1, l3 = tf.split(l0, [ch1, ch3], axis=-1)
     # 3x3
-    l3 = Conv2D('conv3/1', l0, ch3, 1, padding='SAME', activation=BNReLU)
-    l3 = Conv2D('conv3/2', l3, ch1, 4, strides=2, padding='SAME', activation=None)
-    l3 = BatchNorm('conv3/2/bn', l3)
-    ll.append(l3)
-    # 5x5
-    if num_block == 3:
-        l5 = Conv2D('conv5/1', l0, ch3, 1, padding='SAME', activation=BNReLU)
-        # l5 = BatchNorm('conv5/1/bn', l5)
-        l5 = Conv2D('conv5/2', l5, ch3, 4, strides=2, padding='SAME', activation=BNReLU)
-        l5 = Conv2D('conv5/3', l5, ch1, 3, padding='SAME', activation=None)
-        l5 = BatchNorm('conv5/3/bn', l5)
-        ll.append(l5)
-
-    lc = tf.concat(ll, axis=-1)
-    return lc
+    l3 = Conv2D('conv3', l3, ch3, 3, padding='SAME', activation=BNReLU)
+    # concat
+    lc = tf.concat([l1, l3], axis=-1)
+    out = Conv2D('convc', lc, ch, 1, activation=None)
+    out = BatchNorm('convc/bn', out)
+    # # residual
+    # if residual:
+    #     out = tf.add(data, out, name='out')
+    return out
 
 
 def _get_logits(image, num_classes=1000):
-    with pvanet_argscope():
+    #
+    multiplier = args.multiplier
+    #
+    def _get_cch(ch):
+        return round(np.sqrt(ch) * 2.0 / 4) * 4
+
+    with avanet_argscope():
+        # dropblock
+        if get_current_tower_context().is_training:
+            keep_prob = tf.get_variable('keep_prob', (),
+                                        dtype=tf.float32,
+                                        trainable=False)
+        else:
+            keep_prob = None
+
         l = image #tf.transpose(image, perm=[0, 2, 3, 1])
         # conv1
-        l = Conv2D('conv1', l, 12, 4, strides=2, activation=None, padding='SAME')
+        ch1 = round(12 * multiplier)
+        l = Conv2D('conv1', l, ch1, 4, strides=2, activation=None, padding='SAME')
         with tf.variable_scope('conv1'):
             l = BNReLU(tf.concat([l, -l], -1))
         l = MaxPooling('pool1', l, 2, strides=2, padding='SAME')
         # conv2
-        l = inception('conv2', l, 24, roll_idx=0, num_block=2, active_first=False)
-        l = Conv2D('conv3', l, 24, 1, activation=None)
-        l = BatchNorm('conv3/bn', l)
+        ch2 = ch1 * 2
+        l = inception('conv2', l, ch2, int(_get_cch(ch2)), residual=False)
+        l = inception('conv3', l, ch2, int(_get_cch(ch2)), kernel=5)
 
-        channels = [96, 168, 288]
-        iters = [2, 6, 3]
-        ndivs = [2, 3, 3]
+        ch_all = [round(c * multiplier) for c in [48, 96, 192]]
+        cch_all = [int(_get_cch(c)) for c in ch_all]
+        # import ipdb
+        # ipdb.set_trace()
+        iters = [4, 8, 4]
         # mults = [2, 2, 2]
-        # for ii, (ch, it, ndiv, t) in enumerate(zip(channels, iters, ndivs, mults)):
-        for ii, (ch, it, ndiv) in enumerate(zip(channels, iters, ndivs)):
+        for ii, (ch, cch, it) in enumerate(zip(ch_all, cch_all, iters)):
             for jj in range(it):
                 name = 'inc{}/{}'.format(ii+1, jj+1)
-                # k = 5 if (jj % 4 == 3) else 3
+                k = 3 if (jj % 2 == 0) else 5
                 if jj == 0:
-                    l = downception(name, l, ch//ndiv, ndiv)
+                    l = downception(name, l, ch, cch)
                 else:
-                    l = inception(name, l, ch//ndiv, jj, ndiv)
+                    l = inception(name, l, ch, cch, k)
+            if ii in (0, 1):
+                bs = 7 if ii == 0 else 5
+                l = DropBlock('inc{}/drop'.format(ii+1), l, keep_prob, block_size=bs)
 
-        # # should be 7x7 at this stage, with input size (224, 224)
-        # l = Conv2D('convf', l, 576, 1, activation=BNReLU)
-        # s = l.get_shape().as_list()
-        # l = tf.reshape(l, [-1, s[1]*s[2]*s[3]])
-        # ll = tf.split(l, s[1]*s[2], -1)
-        # ll = [FullyConnected('psroi_proj{}'.format(i), l, 20, activation=BNReLU) \
-        #         for i, l in enumerate(ll)]
-        # fc = tf.concat(ll, axis=-1)
-        #
-        # # fc layers
-        # fc = FullyConnected('fc6/L', fc, 128, activation=None)
-        # fc = FullyConnected('fc6/U', fc, 4096, activation=BNReLU)
-        # # fc = Dropout('fc6/Drop', fc, rate=0.25)
-        # fc = FullyConnected('fc7/L', fc, 128, activation=None)
-        # fc = FullyConnected('fc7/U', fc, 4096, activation=BNReLU)
-        # # fc = Dropout('fc7/Drop', fc, rate=0.25)
-        #
-        # logits = FullyConnected('linear', fc, num_classes, use_bias=True)
 
         # The original implementation
         l = Conv2D('convf', l, 1280, 1, activation=BNReLU)
         l = GlobalAvgPooling('poolf', l)
 
         fc = tf.layers.flatten(l)
+        fc = Dropout('dropf', fc, rate=0.1)
         logits = FullyConnected('linear', fc, num_classes, use_bias=True)
     return logits
 
@@ -235,17 +237,51 @@ def get_config(model, nr_tower):
     dataset_train = get_data('train', batch, parallel)
     dataset_val = get_data('val', batch, parallel)
 
-    num_example = 1280000 if args.dataset == 'imagenet' else 1592085
-    step_size = num_example // (batch * nr_tower)
-    max_iter = int(step_size * 300)
-    max_epoch = (max_iter // step_size) + 1
+    ediv = 16 # divide each epoch into ediv sub-epochs
+
+    num_example = 1280000 if args.dataset == 'imagenet' else 1592088
+    step_size = num_example // (batch * nr_tower * ediv)
+    max_iter = int(step_size * 256 * ediv)
+    # max_iter = 3 * 10**5
+    max_epoch = (max_iter // step_size)
+    lr_decay = np.exp(np.log(0.001) / max_epoch)
+    kp_decay = np.exp(np.log(0.9) / max_epoch)
+
+    cyclic_epoch = 64 * ediv
+    max_lr = args.lr
+    min_lr = max_lr * 0.001
+
+    # lr function
+    def _compute_lr(e, x, max_lr, min_lr, cepoch):
+        # we won't use x, but this is the function template anyway
+        lr = 0.5 * (1. + np.cos((e % cepoch) / float(cepoch - 1) * np.pi))
+        lr = min_lr + (max_lr - min_lr) * lr
+        return lr
+
     callbacks = [
         ModelSaver(),
-        ScheduledHyperParamSetter('learning_rate',
-                                  [(0, 0.5),]),
-        HyperParamSetterWithFunc('learning_rate',
-                                 lambda e, x: x * 0.975 if e > 0 else x)
+        # ScheduledHyperParamSetter('learning_rate',
+        #                           [(0, max_lr),]),
+        # HyperParamSetterWithFunc('learning_rate',
+        #                          lambda e, x: x * lr_decay if e > 0 else x),
+        HyperParamSetterWithFunc(
+            'learning_rate', partial(_compute_lr, max_lr=max_lr, min_lr=min_lr, cepoch=cyclic_epoch)),
+        ScheduledHyperParamSetter('keep_prob',
+                                  [(0, 1.0),]),
+        HyperParamSetterWithFunc('keep_prob',
+                                 lambda e, x: x * kp_decay if e > 0 else x),
     ]
+    # num_example = 1280000 if args.dataset == 'imagenet' else 1592085
+    # step_size = num_example // (batch * nr_tower)
+    # max_iter = int(step_size * 300)
+    # max_epoch = (max_iter // step_size) + 1
+    # callbacks = [
+    #     ModelSaver(),
+    #     ScheduledHyperParamSetter('learning_rate',
+    #                               [(0, 0.5),]),
+    #     HyperParamSetterWithFunc('learning_rate',
+    #                              lambda e, x: x * 0.975 if e > 0 else x)
+    # ]
     # callbacks = [
     #     ModelSaver(),
     #     ScheduledHyperParamSetter('learning_rate',
@@ -284,7 +320,10 @@ if __name__ == '__main__':
     parser.add_argument('--gpu', help='comma separated list of GPU(s) to use.')
     parser.add_argument('--data', help='ILSVRC or OpenImage dataset dir')
     parser.add_argument('--batch', help='batch size', type=int, default=128)
+    parser.add_argument('--lr', help='initial learning rage', type=float, default=0.4)
     parser.add_argument('--parallel', help='number of cpu workers prefetching data', type=int, default=0)
+    parser.add_argument('--multiplier', help='network channel multiplier', type=float, default=1.0)
+    parser.add_argument('--logdir', help='checkpoint directory', type=str, default='')
     # parser.add_argument('-r', '--ratio', type=float, default=0.5, choices=[1., 0.5])
     # parser.add_argument('--group', type=int, default=8, choices=[3, 4, 8],
     #                     help="Number of groups for ShuffleNetV1")
@@ -330,6 +369,8 @@ if __name__ == '__main__':
                     "as 1 flop because it can be executed in one instruction.")
     else:
         name = 'avanet'
+        if args.logdir:
+            name = args.logdir
         logger.set_logger_dir(os.path.join('train_log', name))
 
         nr_tower = max(get_num_gpu(), 1)

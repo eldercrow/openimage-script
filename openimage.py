@@ -14,6 +14,8 @@ from tensorpack.utils.fs import mkdir_p #, download, get_dataset_path
 from tensorpack.utils.timer import timed_operation
 from tensorpack.dataflow.base import DataFlow, RNGDataFlow
 
+import numpy as np
+
 __all__ = ['OpenImageMeta', 'OpenImage', 'OpenImageFiles']
 
 # CAFFE_OpenImage12_URL = ("http://dl.caffe.berkeleyvisin.org/caffe_ilsvrc12.tar.gz", 17858008)
@@ -25,32 +27,53 @@ class OpenImageMeta(object):
     """
 
     def __init__(self, path_db):
+        #
         self.dir = os.path.expanduser(path_db)
+        #
+        fname = os.path.join(self.dir, 'annotations', 'labels_used.txt')
+        assert os.path.isfile(fname)
+        lines = [x.strip().split(',') for x in open(fname).readlines()]
+
+        synset_list = [l[0].strip() for l in lines]
+        self.synset_dict = { ii: l for ii, l in enumerate(synset_list) }
+        # class-wise weights, considering their frequencies
+        cls_weights = np.array([int(l[3].strip()) for l in lines])
+        min_w = np.min(cls_weights)
+        cls_weights = np.sqrt(min_w / cls_weights)
+
+        self.cls_weights = cls_weights
         # mkdir_p(self.dir)
         # f = os.path.join(self.dir, 'synsets.txt')
         # if not os.path.isfile(f):
         #     self._download_caffe_meta()
         # self.caffepb = None
 
-    def get_synset_words_1000(self):
-        """
-        Returns:
-            dict: {cls_number: cls_name}
-        """
-        fname = os.path.join(self.dir, 'annotation', 'imagelabel_idx2cid.txt')
-        assert os.path.isfile(fname)
-        lines = [x.strip().split(',') for x in open(fname).readlines()]
-        return { int(l[0].strip()): l[1].strip() for l in lines }
+    # def get_synset_words_1000(self):
+    #     """
+    #     Returns:
+    #         dict: {cls_number: cls_name}
+    #     """
+    #     fname = os.path.join(self.dir, 'annotations', 'imagelabel_idx2cid.txt')
+    #     assert os.path.isfile(fname)
+    #     lines = [x.strip().split(',') for x in open(fname).readlines()]
+    #     return { int(l[0].strip()): l[1].strip() for l in lines }
 
     def get_synset_1000(self):
         """
+        synset is not 1000 classes any more, but just keeping the name.
+
         Returns:
             dict: {cls_number: synset_id}
         """
-        fname = os.path.join(self.dir, 'annotation', 'imagelabel_idx2cname.txt')
-        assert os.path.isfile(fname)
-        lines = [x.strip().split(',') for x in open(fname).readlines()]
-        return { int(l[0].strip()): l[1].strip() for l in lines }
+        return self.synset_dict
+        # fname = os.path.join(self.dir, 'annotations', 'labels_used.txt')
+        # assert os.path.isfile(fname)
+        # lines = [x.strip().split(',')[0] for x in open(fname).readlines()]
+        # return { ii: l for ii, l in enumerate(lines) }
+
+    @property
+    def num_classes(self):
+        return len(self.get_synset_1000())
 
     def get_image_list(self, name):
         """
@@ -60,36 +83,43 @@ class OpenImageMeta(object):
         Returns:
             list: list of (image filename, positive label, negative label)
         """
-        assert name in ['train', 'val', 'test']
+        assert name in ['train', 'validation', 'test']
 
-        fn_list = os.path.join(self.dir, 'annotation', '{}_imagelist.txt'.format(name))
+        fn_list = os.path.join(self.dir, 'annotations', '{}_imagelist.txt'.format(name))
         with open(fn_list, 'r') as fh:
             img_names = [f.strip() for f in fh.readlines()]
 
         res = { n: [[], []] for n in img_names }
 
-        fn_pos = os.path.join(self.dir, 'annotation', '{}_positive_imagelabel.txt'.format(name))
-        fn_neg = os.path.join(self.dir, 'annotation', '{}_negative_imagelabel.txt'.format(name))
+        fn_pos = os.path.join(self.dir, 'annotations', '{}_positive_imagelabel.txt'.format(name))
+        fn_neg = os.path.join(self.dir, 'annotations', '{}_negative_imagelabel.txt'.format(name))
         assert os.path.isfile(fn_pos), fn_pos
         assert os.path.isfile(fn_neg), fn_neg
 
+        class_dict = self.get_synset_1000()
+        inv_dict = {v: k for k, v in class_dict.items()}
+
         with open(fn_pos) as fh:
-            for line in fh.readlines():
-                datum = line.strip().split(',')
-                fname = datum[0].strip()
-                if fname not in res:
-                    continue
-                labels = [int(d.strip()) for d in datum[1:]]
-                res[fname][0] = labels
+            lines = fh.readlines()
+
+        for line in lines:
+            datum = line.strip().split(',')
+            fname = datum[0].strip()
+            if fname not in res:
+                continue
+            labels = [inv_dict[d.strip()] for d in datum[1:]]
+            res[fname][0] += labels
 
         with open(fn_neg) as fh:
-            for line in fh.readlines():
-                datum = line.strip().split(',')
-                fname = datum[0].strip()
-                if fname not in res:
-                    continue
-                labels = [int(d.strip()) for d in datum[1:]]
-                res[fname][1] += labels
+            lines = fh.readlines()
+
+        for line in lines:
+            datum = line.strip().split(',')
+            fname = datum[0].strip()
+            if fname not in res:
+                continue
+            labels = [inv_dict[d.strip()] for d in datum[1:]]
+            res[fname][1] += labels
 
         ret = [(k, v[0], v[1]) for k, v in res.items()]
         return ret
@@ -128,10 +158,10 @@ class OpenImageFiles(RNGDataFlow):
         """
         Same as in :class:`OpenImage`.
         """
-        assert name in ['train', 'test', 'val'], name
+        assert name in ['train', 'test', 'validation'], name
         path_db = os.path.expanduser(path_db)
         assert os.path.isdir(path_db), path_db
-        self.img_dir = os.path.join(path_db, 'image', name)
+        self.img_dir = os.path.join(path_db, 'images', name)
         # self.full_dir = os.path.join(path_db, name)
         self.name = name
         assert os.path.isdir(self.img_dir), self.img_dir
@@ -146,9 +176,11 @@ class OpenImageFiles(RNGDataFlow):
         #     dir_structure = OpenImageMeta.guess_dir_structure(self.full_dir)
 
         meta = OpenImageMeta(path_db)
+        self.num_classes = meta.num_classes
         self.imglist = meta.get_image_list(name)
         assert len(self.imglist) > 0
 
+        self.cls_weights = meta.cls_weights
         # for fname, _, _ in self.imglist[:10]:
         #     fname = os.path.join(self.img_dir, fname + '.jpg')
         #     if not os.path.isfile(fname):
@@ -164,13 +196,15 @@ class OpenImageFiles(RNGDataFlow):
         for k in idxs:
             fname, pos_labels, neg_labels = self.imglist[k]
             fname = os.path.join(self.img_dir, fname + '.jpg')
-            labels = np.zeros((601), dtype=np.float32)
+            labels = np.zeros((self.num_classes), dtype=np.float32)
             weights = \
-                    np.zeros((601), dtype=np.float32) \
+                    np.zeros((self.num_classes), dtype=np.float32) \
                     if neg_labels else \
-                    np.ones((601), dtype=np.float32)
+                    np.zeros((self.num_classes), dtype=np.float32)
             labels[pos_labels] = 1
             weights[pos_labels + neg_labels] = 1
+            # class-wise weighting, for handling class imbalance
+            weights *= self.cls_weights
             yield fname, labels, weights
 
     # def get_data(self):
@@ -186,15 +220,16 @@ class OpenImage(OpenImageFiles):
         Args:
             dir (str): A directory containing a subdir named ``name``,
                 containing the images in a structure described below.
-            name (str): One of 'train' or 'val' or 'test'.
+            name (str): One of 'train' or 'validation' or 'test'.
             shuffle (bool): shuffle the dataset.
                 Defaults to True if name=='train'.
 
         Directory structure:
             path_db/
-              image/
-                train/
-                val/
+                images/
+                    train/
+                    validation/
+                annotations/
 
         """
         super(OpenImage, self).__init__(path_db, name, shuffle)
@@ -244,7 +279,7 @@ if __name__ == '__main__':
     # meta = OpenImageMeta('./data')
     # print(meta.get_synset_words_1000())
 
-    ds = OpenImageFiles('~/dataset/openimage', 'train', shuffle=True)
+    ds = OpenImageFiles('~/dataset/openimage', 'validation', shuffle=True)
     ds.reset_state()
 
     for ii, k in enumerate(ds):

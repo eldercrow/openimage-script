@@ -88,6 +88,8 @@ R-package/R/mxnet_generated.R
 *.txt
 *.npz
 *.pb
+*.lmdb
+*.lmdb-lock
 
 # ipython notebook
 *_pb2.py
