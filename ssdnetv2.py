@@ -43,7 +43,7 @@ def ssdnet_argscope():
 
 
 @layer_register(log_shape=True)
-def DropBlock(x, keep_prob=None, block_size=5, data_format='NHWC'):
+def DropBlock(x, keep_prob=None, block_size=5, drop_mult=1.0, data_format='NHWC'):
     '''
     DropBlock
     '''
@@ -53,11 +53,12 @@ def DropBlock(x, keep_prob=None, block_size=5, data_format='NHWC'):
     assert data_format in ('NHWC', 'channels_last')
     feat_size = x.get_shape().as_list()[1]
 
+    dp = (1. - keep_prob) * drop_mult
     f2 = feat_size * feat_size
     b2 = block_size * block_size
     r = (feat_size - block_size + 1)
     r2 = r*r
-    gamma = (1. - keep_prob) * f2 / b2 / r2
+    gamma = dp * f2 / b2 / r2
     k = [1, block_size, block_size, 1]
 
     mask = tf.less(tf.random_uniform(tf.shape(x), 0, 1), gamma)
@@ -96,7 +97,6 @@ def DWConv(x, kernel, padding='SAME', stride=1, w_init=None, active=True, data_f
 @layer_register(log_shape=True)
 def LinearBottleneck(x, ich, och, kernel,
                      padding='SAME',
-                     stride=1,
                      active=False,
                      t=3,
                      w_init=None):
@@ -104,7 +104,7 @@ def LinearBottleneck(x, ich, och, kernel,
     mobilenetv2 linear bottlenet.
     '''
     out = Conv2D('conv_e', x, int(ich*t), 1, activation=BNReLU)
-    out = DWConv('conv_d', out, kernel, padding, stride, w_init, active)
+    out = DWConv('conv_d', out, kernel, padding, 1, w_init, active)
     out = Conv2D('conv_p', out, och, 1, activation=None)
     with tf.variable_scope('conv_p'):
         out = BatchNorm('bn', out)
@@ -114,17 +114,15 @@ def LinearBottleneck(x, ich, och, kernel,
 @layer_register(log_shape=True)
 def DownsampleBottleneck(x, ich, och, kernel,
                          padding='SAME',
-                         stride=2,
                          active=False,
                          t=3,
                          w_init=None):
     '''
     downsample linear bottlenet.
     '''
-    out_e = Conv2D('conv_e', x, ich*t, 1, activation=BNReLU)
-    out_d = DWConv('conv_d', out_e, kernel, padding, stride, w_init, active)
-    out_m = DWConv('conv_m', out_e, kernel, padding, stride, w_init, active)
-    out = tf.concat([out_d, out_m], axis=-1)
+    out = Conv2D('conv_e', x, ich*t, 1, activation=BNReLU)
+    out = MaxPooling('pool_e', out, 2, strides=2, padding='SAME')
+    out = DWConv('conv_d', out, kernel, padding, 1, w_init, active)
     out = Conv2D('conv_p', out, och, 1, activation=None)
     with tf.variable_scope('conv_p'):
         out = BatchNorm('bn', out)
@@ -136,12 +134,12 @@ def inception(x, ich, stride, t=3, swap_block=False, w_init=None, active=False):
     '''
     ssdnet inception layer.
     '''
-    k = 4 if stride == 2 else 3
+    k = 3 #if stride == 2 else 3
     och = ich * 2
     if stride == 1:
-        oi = LinearBottleneck('conv1', x, och, och, k, stride=stride, t=t, w_init=w_init, active=active)
+        oi = LinearBottleneck('conv1', x, och, och, k, t=t, w_init=w_init, active=active)
     else:
-        oi = DownsampleBottleneck('conv1', x, ich, och, k, stride=stride, t=t, w_init=w_init, active=active)
+        oi = DownsampleBottleneck('conv1', x, och, och, k, t=t, w_init=w_init, active=active)
     oi = tf.split(oi, 2, axis=-1)
     o1 = oi[0]
     o2 = oi[1] + LinearBottleneck('conv2', oi[1], ich, ich, 5, t=t, w_init=w_init, active=active)
@@ -186,14 +184,15 @@ def _get_logits(image, num_classes=1000, mu=1.0):
         ichs = [int(round(ich0*c)) for c in (1, 2, 4)]
         ochs = [i*2 for i in ichs]
         iters = [2, 4, 2]
+        drop_mults = [0.75, 0.45, 0.0]
         t = 3
-        for ii, (ich, och, it) in enumerate(zip(ichs, ochs, iters)):
+        for ii, (ich, och, it, dm) in enumerate(zip(ichs, ochs, iters, drop_mults)):
             with tf.variable_scope('inc{}'.format(ii)):
                 for jj in range(it):
                     stride = 2 if jj == 0 else 1
                     l = inception('{}'.format(jj), l, ich, stride, t, (jj%2==1), active=False)
                     if ii in (0, 1):
-                        l = DropBlock('{}/drop'.format(jj), l, keep_prob, block_size=7)
+                        l = DropBlock('{}/drop'.format(jj), l, keep_prob, block_size=7, drop_mult=dm)
         # # should be 7x7 at this stage, with input size (224, 224)
         # l = Conv2D('convf', l, 576, 1, activation=BNReLU)
         # s = l.get_shape().as_list()
@@ -285,15 +284,18 @@ def get_config(model, nr_tower):
     max_iter = int(step_size * 250)
     # max_iter = 3 * 10**5
     max_epoch = (max_iter // step_size) + 1
+    lr_decay = np.exp(np.log(0.001) / max_epoch)
+    kp_decay = np.exp(np.log(0.9) / max_epoch)
     callbacks = [
         ModelSaver(),
         ScheduledHyperParamSetter('learning_rate',
-                                  [(0, 0.4),]),
+                                  [(0, 0.2),]),
         HyperParamSetterWithFunc('learning_rate',
-                                 lambda e, x: x * 0.975 if e > 0 else x),
+                                 lambda e, x: x * lr_decay if e > 0 else x),
         ScheduledHyperParamSetter('keep_prob',
-                                  [(0, 1.0), (max_epoch, 0.9)],
-                                  interp='linear')
+                                  [(0, 1.0),]),
+        HyperParamSetterWithFunc('keep_prob',
+                                 lambda e, x: x * kp_decay if e > 0 else x),
     ]
     # callbacks = [
     #     ModelSaver(),
