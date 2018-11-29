@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # File: imagenet_utils.py
 
-
+import os
 import cv2
 import numpy as np
 import multiprocessing
@@ -11,7 +11,8 @@ from abc import abstractmethod
 from tensorpack import imgaug, dataset, ModelDesc
 from tensorpack.dataflow import (
     AugmentImageComponent, PrefetchDataZMQ,
-    BatchData, MultiThreadMapData)
+    BatchData, MultiThreadMapData,
+    LMDBSerializer, LocallyShuffleData, PrefetchData, MapDataComponent)
 from tensorpack.predict import PredictConfig, SimpleDatasetPredictor
 from tensorpack.utils.stats import RatioCounter
 from tensorpack.models import regularize_cost
@@ -50,32 +51,29 @@ class GoogleNetResize(imgaug.ImageAugmentor):
         return out
 
 
-def fbresnet_augmentor(isTrain):
+def fbresnet_augmentor(isTrain, aug_level=2, target_shape=224, crop_area_fraction=0.08):
     """
     Augmentor used in fb.resnet.torch, for BGR images in range [0,255].
     """
     if isTrain:
-        augmentors = [
-            GoogleNetResize(),
-            # It's OK to remove the following augs if your CPU is not fast enough.
-            # Removing brightness/contrast/saturation does not have a significant effect on accuracy.
-            # Removing lighting leads to a tiny drop in accuracy.
-            imgaug.RandomOrderAug(
-                [imgaug.BrightnessScale((0.6, 1.4), clip=False),
-                 imgaug.Contrast((0.6, 1.4), clip=False),
-                 imgaug.Saturation(0.4, rgb=False),
-                 # rgb-bgr conversion for the constants copied from fb.resnet.torch
-                 imgaug.Lighting(0.1,
-                                 eigval=np.asarray(
-                                     [0.2175, 0.0188, 0.0045][::-1]) * 255.0,
-                                 eigvec=np.array(
-                                     [[-0.5675, 0.7192, 0.4009],
-                                      [-0.5808, -0.0045, -0.8140],
-                                      [-0.5836, -0.6948, 0.4203]],
-                                     dtype='float32')[::-1, ::-1]
-                                 )]),
-            imgaug.Flip(horiz=True),
-        ]
+        augmentors = [imgaug.Flip(horiz=True),]
+        if aug_level > 0:
+            augmentors.append(GoogleNetResize(crop_area_fraction=crop_area_fraction,
+                                              target_shape=target_shape))
+        if aug_level > 1:
+            baug = imgaug.BrightnessScale((0.6, 1.4), clip=False)
+            caug = imgaug.Contrast((0.6, 1.4), clip=False)
+            saug = imgaug.Saturation(0.4, rgb=False)
+            laug = imgaug.Lighting(0.1,
+                                   # rgb-bgr conversion for the constants copied from fb.resnet.torch
+                                   eigval=np.asarray( [0.2175, 0.0188, 0.0045][::-1]) * 255.0,
+                                   eigvec=np.array([[-0.5675, 0.7192, 0.4009],
+                                                    [-0.5808, -0.0045, -0.8140],
+                                                    [-0.5836, -0.6948, 0.4203]],
+                                                    dtype='float32')[::-1, ::-1])
+
+            coloraug = imgaug.RandomOrderAug([baug, caug, saug, laug])
+            augmentors.append(coloraug)
     else:
         augmentors = [
             imgaug.ResizeShortestEdge(256, cv2.INTER_CUBIC),
@@ -86,7 +84,7 @@ def fbresnet_augmentor(isTrain):
 
 def get_imagenet_dataflow(
         datadir, name, batch_size,
-        augmentors, parallel=None):
+        augmentors, binary=False, parallel=None):
     """
     See explanations in the tutorial:
     http://tensorpack.readthedocs.io/en/latest/tutorial/efficient-dataflow.html
@@ -95,23 +93,39 @@ def get_imagenet_dataflow(
     assert datadir is not None
     assert isinstance(augmentors, list)
     isTrain = name == 'train'
-    if parallel is None:
+    if parallel is None or parallel <= 0:
         parallel = min(40, multiprocessing.cpu_count() - 2)  # assuming hyperthreading
         # parallel = min(40, multiprocessing.cpu_count() // 2)  # assuming hyperthreading
     if isTrain:
-        ds = dataset.ILSVRC12(datadir, name, shuffle=True)
+        if binary:
+            lmdb = os.path.join(datadir, 'imagenet-{}.lmdb'.format(name))
+            ds = LMDBSerializer.load(lmdb, shuffle=True)
+            ds = LocallyShuffleData(ds, 50000)
+            ds = PrefetchData(ds, 5000, 1)
+            ds = MapDataComponent(ds, lambda x: cv2.imdecode(x, cv2.IMREAD_COLOR), 0)
+        else:
+            ds = dataset.ILSVRC12(datadir, name, shuffle=True)
         ds = AugmentImageComponent(ds, augmentors, copy=False)
         if parallel < 16:
             logger.warn("DataFlow may become the bottleneck when too few processes ({}) are used.".format(parallel))
         ds = PrefetchDataZMQ(ds, parallel)
         ds = BatchData(ds, batch_size, remainder=False)
     else:
-        ds = dataset.ILSVRC12Files(datadir, name, shuffle=False)
+        if binary:
+            lmdb = os.path.join(datadir, 'imagenet-{}.lmdb'.format(name))
+            ds = LMDBSerializer.load(lmdb, shuffle=False)
+            ds = PrefetchData(ds, 5000, 1)
+            # ds = MapDataComponent(ds, lambda x: cv2.imdecode(x, cv2.IMREAD_COLOR), 0)
+        else:
+            ds = dataset.ILSVRC12Files(datadir, name, shuffle=False)
         aug = imgaug.AugmentorList(augmentors)
 
         def mapf(dp):
             fname, cls = dp
-            im = cv2.imread(fname, cv2.IMREAD_COLOR)
+            if binary:
+                im = cv2.imdecode(fname, cv2.IMREAD_COLOR)
+            else:
+                im = cv2.imread(fname, cv2.IMREAD_COLOR)
             im = aug.augment(im)
             return im, cls
         ds = MultiThreadMapData(ds, parallel, mapf, buffer_size=2000, strict=True)
@@ -157,12 +171,12 @@ class ImageNetModel(ModelDesc):
     """
     image_bgr = True
 
-    weight_decay = 1e-4
+    weight_decay = 4e-05
 
     """
     To apply on normalization parameters, use '.*/W|.*/gamma|.*/beta'
     """
-    weight_decay_pattern = '.*/W'
+    weight_decay_pattern = '.*/(?:W|gamma)'
 
     """
     Scale the loss, for whatever reasons (e.g., gradient averaging, fp16 training, etc)
@@ -233,7 +247,8 @@ class ImageNetModel(ModelDesc):
     @staticmethod
     def compute_loss_and_error(logits, label):
         loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=label)
-        loss = tf.reduce_mean(loss, name='xentropy-loss')
+        rw = tf.random_uniform(tf.shape(loss), 0, 2)
+        loss = tf.reduce_mean(loss*rw, name='xentropy-loss')
 
         def prediction_incorrect(logits, label, topk=1, name='incorrect_vector'):
             with tf.name_scope('prediction_incorrect'):
