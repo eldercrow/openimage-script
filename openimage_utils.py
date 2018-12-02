@@ -28,11 +28,14 @@ def get_openimage_dataflow(
     See explanations in the tutorial:
     http://tensorpack.readthedocs.io/en/latest/tutorial/efficient-dataflow.html
     """
-    assert name in ['train', 'val', 'test']
+    if name == 'val':
+        name = 'validation'
+
+    assert name in ['train', 'validation', 'test']
     assert datadir is not None
     assert isinstance(augmentors, list)
-    isTrain = name == 'train'
-    if parallel is None:
+    isTrain = (name == 'train')
+    if parallel is None or parallel <= 0:
         parallel = min(40, multiprocessing.cpu_count() // 2)  # assuming hyperthreading
     if isTrain:
         ds = OpenImage(datadir, name, shuffle=True)
@@ -75,6 +78,8 @@ def eval_on_OpenImage(model, sessinit, dataflow):
 class OpenImageModel(ModelDesc):
     image_shape = 224
 
+    num_classes = 601
+
     """
     uint8 instead of float32 is used as input type to reduce copy overhead.
     It might hurt the performance a liiiitle bit.
@@ -106,8 +111,8 @@ class OpenImageModel(ModelDesc):
 
     def inputs(self):
         return [tf.placeholder(self.image_dtype, [None, self.image_shape, self.image_shape, 3], 'input'),
-                tf.placeholder(tf.float32, [None, 601], 'labels'),
-                tf.placeholder(tf.float32, [None, 601], 'weights')]
+                tf.placeholder(tf.float32, [None, self.num_classes], 'labels'),
+                tf.placeholder(tf.float32, [None, self.num_classes], 'weights')]
 
     def build_graph(self, image, labels, weights):
         image = OpenImageModel.image_preprocess(image, bgr=self.image_bgr)
@@ -115,7 +120,7 @@ class OpenImageModel(ModelDesc):
         if self.data_format == 'NCHW':
             image = tf.transpose(image, [0, 3, 1, 2])
 
-        logits = self.get_logits(image)
+        logits = self.get_logits(image, self.num_classes)
         sigmoid_loss, softmax_loss = OpenImageModel.compute_loss_and_error(logits, labels, weights)
 
         if self.weight_decay > 0:

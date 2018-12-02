@@ -6,6 +6,7 @@ import cv2
 import os
 import numpy as np
 import tensorflow as tf
+from functools import partial
 
 from contextlib import contextmanager
 
@@ -32,6 +33,8 @@ from imagenet_utils import ImageNetModel as _ImageNetModel
 from openimage_utils import get_openimage_dataflow
 from openimage_utils import OpenImageModel as _OpenImageModel
 
+from openimage import OpenImageMeta
+
 # TOTAL_BATCH_SIZE = 1024 #512
 
 
@@ -50,23 +53,26 @@ def DropBlock(x, keep_prob=None, block_size=5, drop_mult=1.0, data_format='NHWC'
     if keep_prob is None or not get_current_tower_context().is_training:
         return x
 
+    drop_prob = (1.0 - keep_prob) * drop_mult
+
     assert data_format in ('NHWC', 'channels_last')
     feat_size = x.get_shape().as_list()[1]
+    N = tf.to_float(tf.size(x))
 
     dp = (1. - keep_prob) * drop_mult
     f2 = feat_size * feat_size
     b2 = block_size * block_size
     r = (feat_size - block_size + 1)
     r2 = r*r
-    gamma = dp * f2 / b2 / r2
+    gamma = drop_prob * f2 / b2 / r2
     k = [1, block_size, block_size, 1]
 
     mask = tf.less(tf.random_uniform(tf.shape(x), 0, 1), gamma)
     mask = tf.cast(mask, dtype=x.dtype)
     mask = tf.nn.max_pool(mask, ksize=k, strides=[1, 1, 1, 1], padding='SAME')
-    drop_mask = (1. - mask) * (1. / keep_prob)
+    drop_mask = (1. - mask)
+    drop_mask *= (N / tf.reduce_sum(drop_mask))
     drop_mask = tf.stop_gradient(drop_mask, name='drop_mask')
-    # drop_mask = tf.Print(drop_mask, [tf.reduce_sum(drop_mask)])
     return tf.multiply(x, drop_mask, name='dropped')
 
 
@@ -142,7 +148,7 @@ def inception(x, ich, stride, t=3, swap_block=False, w_init=None, active=False):
         oi = DownsampleBottleneck('conv1', x, och, och, k, t=t, w_init=w_init, active=active)
     oi = tf.split(oi, 2, axis=-1)
     o1 = oi[0]
-    o2 = oi[1] + LinearBottleneck('conv2', oi[1], ich, ich, 5, t=t, w_init=w_init, active=active)
+    o2 = oi[1] + LinearBottleneck('conv2', oi[1], ich, ich, 5, t=t, w_init=w_init, active=False)
     # o3 = LinearBottleneck('conv3', o2, ich//2, ich//2, 5, t=t, w_init=w_init)
 
     if not swap_block:
@@ -177,22 +183,23 @@ def _get_logits(image, num_classes=1000, mu=1.0):
         l = MaxPooling('pool2', l, 2, strides=2, padding='SAME')
         ch2 = ch1*2 # base=24
         # conv3
-        l = LinearBottleneck('conv3', l, ch2, ch2, 3, t=2, active=False)
+        l = LinearBottleneck('conv3', l, ch2, ch2, 3, t=3, active=True)
 
         # inception layers
         ich0 = int(round(24*mu)) # base=24
         ichs = [int(round(ich0*c)) for c in (1, 2, 4)]
         ochs = [i*2 for i in ichs]
         iters = [2, 4, 2]
-        drop_mults = [0.75, 0.45, 0.0]
+        dmults = [1.0, 1.0, 0.0]
         t = 3
-        for ii, (ich, och, it, dm) in enumerate(zip(ichs, ochs, iters, drop_mults)):
+        for ii, (ich, och, it, dm) in enumerate(zip(ichs, ochs, iters, dmults)):
             with tf.variable_scope('inc{}'.format(ii)):
                 for jj in range(it):
                     stride = 2 if jj == 0 else 1
-                    l = inception('{}'.format(jj), l, ich, stride, t, (jj%2==1), active=False)
+                    l = inception('{}'.format(jj), l, ich, stride, t, (jj%2==1), active=True)
                     if ii in (0, 1):
-                        l = DropBlock('{}/drop'.format(jj), l, keep_prob, block_size=7, drop_mult=dm)
+                        bs = 7 if ii == 0 else 5
+                        l = DropBlock('{}/drop'.format(jj), l, keep_prob, block_size=bs, drop_mult=dm)
         # # should be 7x7 at this stage, with input size (224, 224)
         # l = Conv2D('convf', l, 576, 1, activation=BNReLU)
         # s = l.get_shape().as_list()
@@ -217,6 +224,7 @@ def _get_logits(image, num_classes=1000, mu=1.0):
         l = GlobalAvgPooling('poolf', l)
 
         fc = tf.layers.flatten(l)
+        fc = Dropout('dropf', fc, rate=0.1)
         logits = FullyConnected('linear', fc, num_classes, use_bias=True)
     return logits
 
@@ -237,13 +245,13 @@ class OpenImageModel(_OpenImageModel):
         return _get_logits(image, num_classes)
 
 
-def get_data(name, batch):
+def get_data(name, batch, parallel=0):
     isTrain = name == 'train'
 
     if isTrain:
         augmentors = [
             # use lighter augs if model is too small
-            GoogleNetResize(crop_area_fraction=0.16), #0.49
+            GoogleNetResize(crop_area_fraction=0.25), #0.49
             imgaug.RandomOrderAug(
                 [imgaug.BrightnessScale((0.6, 1.4), clip=False),
                  imgaug.Contrast((0.6, 1.4), clip=False),
@@ -266,22 +274,25 @@ def get_data(name, batch):
             imgaug.CenterCrop((224, 224)),
         ]
 
-    df = get_imagenet_dataflow(args.data, name, batch, augmentors) \
+    df = get_imagenet_dataflow(args.data, name, batch, augmentors, args.binary, args.parallel) \
             if args.dataset == 'imagenet' else \
-            get_openimage_dataflow(args.data, name, batch, augmentors)
+            get_openimage_dataflow(args.data, name, batch, augmentors, args.parallel)
     return df
 
 
 def get_config(model, nr_tower):
     batch = args.batch
+    parallel = args.parallel
 
     logger.info("Running on {} towers. Batch size per tower: {}".format(nr_tower, batch))
     dataset_train = get_data('train', batch)
     dataset_val = get_data('val', batch)
 
+    ediv = 16 # divide each epoch into ediv sub-epochs
+
     num_example = 1280000 if args.dataset == 'imagenet' else 1592088
-    step_size = num_example // (batch * nr_tower)
-    max_iter = int(step_size * 250)
+    step_size = num_example // (batch * nr_tower * ediv)
+    max_iter = int(step_size * 250 * ediv)
     # max_iter = 3 * 10**5
     max_epoch = (max_iter // step_size) + 1
     lr_decay = np.exp(np.log(0.001) / max_epoch)
@@ -336,6 +347,10 @@ if __name__ == '__main__':
     parser.add_argument('--gpu', help='comma separated list of GPU(s) to use.')
     parser.add_argument('--data', help='ILSVRC or OpenImage dataset dir')
     parser.add_argument('--batch', help='batch size', type=int, default=128)
+    parser.add_argument('--lr', help='initial learning rage', type=float, default=0.4)
+    parser.add_argument('--parallel', help='number of cpu workers to use', type=int, default=0)
+    parser.add_argument('--logdir', help='checkpoint directory', type=str, default='')
+    parser.add_argument('--binary', help='use lmdb instead of raw files.', action='store_true')
     # parser.add_argument('-r', '--ratio', type=float, default=0.5, choices=[1., 0.5])
     # parser.add_argument('--group', type=int, default=8, choices=[3, 4, 8],
     #                     help="Number of groups for ShuffleNetV1")
@@ -355,6 +370,8 @@ if __name__ == '__main__':
     #     logger.error("group= is not used in ShuffleNetV2!")
 
     model = ImageNetModel() if args.dataset == 'imagenet' else OpenImageModel()
+    if args.dataset == 'openimage':
+        model.num_classes = OpenImageMeta(args.data).num_classes
 
     if args.eval:
         batch = 192    # something that can run on one gpu
@@ -381,7 +398,9 @@ if __name__ == '__main__':
         logger.info("TensorFlow counts multiply+add as two flops, however the paper counts them "
                     "as 1 flop because it can be executed in one instruction.")
     else:
-        name = 'ssdnetv2'
+        name = 'ssdnetv2' + '_{}'.format(args.dataset)
+        if args.logdir:
+            name = args.logdir
         logger.set_logger_dir(os.path.join('train_log', name))
 
         nr_tower = max(get_num_gpu(), 1)

@@ -6,6 +6,7 @@ import cv2
 import os
 import numpy as np
 import tensorflow as tf
+from functools import partial
 
 from collections import deque
 
@@ -38,16 +39,22 @@ from openimage_utils import OpenImageModel as _OpenImageModel
 
 
 @contextmanager
-def pvanet_argscope():
+def avanet_argscope():
     with argscope([Conv2D, MaxPooling, BatchNorm, GlobalAvgPooling], data_format='NHWC'), \
             argscope([Conv2D, FullyConnected], use_bias=False):
         yield
 
 
 @layer_register(log_shape=True)
+<<<<<<< HEAD
 def inception(data, ch, ch3, residual=True):
+=======
+def DropBlock(x, keep_prob=None, block_size=5, drop_mult=1.0, data_format='NHWC'):
+>>>>>>> 785db795ec78e91078b848caded2f1d5a5ecde83
     '''
+    DropBlock
     '''
+<<<<<<< HEAD
     ch1 = ch - ch3
 
     l0 = Conv2D('conv1', data, ch, 1, activation=None)
@@ -57,6 +64,45 @@ def inception(data, ch, ch3, residual=True):
     l1, l3 = tf.split(l0, [ch1, ch3], axis=-1)
     # 3x3
     l3 = Conv2D('conv3', l3, ch3, 3, padding='SAME', activation=BNReLU)
+=======
+    if keep_prob is None or not get_current_tower_context().is_training:
+        return x
+
+    drop_prob = (1.0 - keep_prob) * drop_mult
+
+    assert data_format in ('NHWC', 'channels_last')
+    feat_size = x.get_shape().as_list()[1]
+    N = tf.to_float(tf.size(x))
+
+    f2 = feat_size * feat_size
+    b2 = block_size * block_size
+    r = (feat_size - block_size + 1)
+    r2 = r*r
+    gamma = drop_prob * f2 / b2 / r2
+    k = [1, block_size, block_size, 1]
+
+    mask = tf.less(tf.random_uniform(tf.shape(x), 0, 1), gamma)
+    mask = tf.cast(mask, dtype=x.dtype)
+    mask = tf.nn.max_pool(mask, ksize=k, strides=[1, 1, 1, 1], padding='SAME')
+    drop_mask = (1. - mask)
+    drop_mask *= (N / tf.reduce_sum(drop_mask))
+    drop_mask = tf.stop_gradient(drop_mask, name='drop_mask')
+    return tf.multiply(x, drop_mask, name='dropped')
+
+
+@layer_register(log_shape=True)
+def inception(data, ch, ch3, kernel=3, residual=True):
+    '''
+    '''
+    ch0 = int(ch * 2)
+    ch1 = ch0 - ch3
+    # 1x1
+    l0 = Conv2D('conv1', data, ch0, 1, activation=BNReLU)
+    # split to l1 and l3
+    l1, l3 = tf.split(l0, [ch1, ch3], axis=-1)
+    # 3x3
+    l3 = Conv2D('conv3', l3, ch3, kernel, padding='SAME', activation=BNReLU)
+>>>>>>> 785db795ec78e91078b848caded2f1d5a5ecde83
     # concat
     lc = tf.concat([l1, l3], axis=-1)
     out = Conv2D('convc', lc, ch, 1, activation=None)
@@ -71,10 +117,18 @@ def inception(data, ch, ch3, residual=True):
 def downception(data, ch, ch3, residual=True):
     '''
     '''
+<<<<<<< HEAD
     ch1 = ch - ch3
 
     data = Conv2D('conv1', data, ch, 2, strides=2, activation=None)
     data = BatchNorm('conv1/bn', data)
+=======
+    ch0 = int(ch * 2)
+    ch1 = ch0 - ch3
+    # downsample
+    data = Conv2D('convd', data, ch0, 2, strides=2, activation=None)
+    data = BatchNorm('convd/bn', data)
+>>>>>>> 785db795ec78e91078b848caded2f1d5a5ecde83
     l0 = tf.nn.relu(data)
     # split to l1 and l3
     l1, l3 = tf.split(l0, [ch1, ch3], axis=-1)
@@ -84,21 +138,43 @@ def downception(data, ch, ch3, residual=True):
     lc = tf.concat([l1, l3], axis=-1)
     out = Conv2D('convc', lc, ch, 1, activation=None)
     out = BatchNorm('convc/bn', out)
+<<<<<<< HEAD
     # residual
     if residual:
         out = tf.add(data, out, name='out')
+=======
+    # # residual
+    # if residual:
+    #     out = tf.add(data, out, name='out')
+>>>>>>> 785db795ec78e91078b848caded2f1d5a5ecde83
     return out
 
 
 def _get_logits(image, num_classes=1000):
-    with pvanet_argscope():
+    #
+    multiplier = args.multiplier
+    #
+    def _get_cch(ch):
+        return round(np.sqrt(ch) * 2.0 / 4) * 4
+
+    with avanet_argscope():
+        # dropblock
+        if get_current_tower_context().is_training:
+            keep_prob = tf.get_variable('keep_prob', (),
+                                        dtype=tf.float32,
+                                        trainable=False)
+        else:
+            keep_prob = None
+
         l = image #tf.transpose(image, perm=[0, 2, 3, 1])
         # conv1
-        l = Conv2D('conv1', l, 12, 4, strides=2, activation=None, padding='SAME')
+        ch1 = round(12 * multiplier)
+        l = Conv2D('conv1', l, ch1, 4, strides=2, activation=None, padding='SAME')
         with tf.variable_scope('conv1'):
             l = BNReLU(tf.concat([l, -l], -1))
         l = MaxPooling('pool1', l, 2, strides=2, padding='SAME')
         # conv2
+<<<<<<< HEAD
         l = inception('conv2', l, 36, 12, residual=False)
         l = inception('conv3', l, 36, 12)
 
@@ -106,10 +182,24 @@ def _get_logits(image, num_classes=1000):
         ch3_all = [int(round(np.sqrt(c) * 2.0 / 4.0)) * 4 for c in ch_all]
         iters = [4, 8, 4]
         for ii, (ch, ch3, it) in enumerate(zip(ch_all, ch3_all, iters)):
+=======
+        ch2 = ch1 * 2
+        l = inception('conv2', l, ch2, int(_get_cch(ch2)), residual=False)
+        l = inception('conv3', l, ch2, int(_get_cch(ch2)), kernel=5)
+
+        ch_all = [round(c * multiplier) for c in [48, 96, 192]]
+        cch_all = [int(_get_cch(c)) for c in ch_all]
+        # import ipdb
+        # ipdb.set_trace()
+        iters = [4, 8, 4]
+        # mults = [2, 2, 2]
+        for ii, (ch, cch, it) in enumerate(zip(ch_all, cch_all, iters)):
+>>>>>>> 785db795ec78e91078b848caded2f1d5a5ecde83
             for jj in range(it):
                 name = 'inc{}/{}'.format(ii+1, jj+1)
-                # k = 5 if (jj % 4 == 3) else 3
+                k = 3 if (jj % 2 == 0) else 5
                 if jj == 0:
+<<<<<<< HEAD
                     l = downception(name, l, ch, ch3)
                 else:
                     l = inception(name, l, ch, ch3)
@@ -132,6 +222,15 @@ def _get_logits(image, num_classes=1000):
         # # fc = Dropout('fc7/Drop', fc, rate=0.25)
         #
         # logits = FullyConnected('linear', fc, num_classes, use_bias=True)
+=======
+                    l = downception(name, l, ch, cch)
+                else:
+                    l = inception(name, l, ch, cch, k)
+            if ii in (0, 1):
+                bs = 7 if ii == 0 else 5
+                l = DropBlock('inc{}/drop'.format(ii+1), l, keep_prob, block_size=bs)
+
+>>>>>>> 785db795ec78e91078b848caded2f1d5a5ecde83
 
         # The original implementation
         l = Conv2D('convf', l, 1280, 1, activation=BNReLU)
@@ -202,6 +301,7 @@ def get_config(model, nr_tower):
     dataset_train = get_data('train', batch, parallel)
     dataset_val = get_data('val', batch, parallel)
 
+<<<<<<< HEAD
     num_example = 1280000 if args.dataset == 'imagenet' else 1592085
     step_size = num_example // (batch * nr_tower)
     max_iter = int(step_size * 250)
@@ -218,7 +318,53 @@ def get_config(model, nr_tower):
         #                           [(0, 1.0),]),
         # HyperParamSetterWithFunc('keep_prob',
         #                          lambda e, x: x * kp_decay if e > 0 else x),
+=======
+    ediv = 16 # divide each epoch into ediv sub-epochs
+
+    num_example = 1280000 if args.dataset == 'imagenet' else 1592088
+    step_size = num_example // (batch * nr_tower * ediv)
+    max_iter = int(step_size * 256 * ediv)
+    # max_iter = 3 * 10**5
+    max_epoch = (max_iter // step_size)
+    lr_decay = np.exp(np.log(0.001) / max_epoch)
+    kp_decay = np.exp(np.log(0.9) / max_epoch)
+
+    cyclic_epoch = 64 * ediv
+    max_lr = args.lr
+    min_lr = max_lr * 0.001
+
+    # lr function
+    def _compute_lr(e, x, max_lr, min_lr, cepoch):
+        # we won't use x, but this is the function template anyway
+        lr = 0.5 * (1. + np.cos((e % cepoch) / float(cepoch - 1) * np.pi))
+        lr = min_lr + (max_lr - min_lr) * lr
+        return lr
+
+    callbacks = [
+        ModelSaver(),
+        # ScheduledHyperParamSetter('learning_rate',
+        #                           [(0, max_lr),]),
+        # HyperParamSetterWithFunc('learning_rate',
+        #                          lambda e, x: x * lr_decay if e > 0 else x),
+        HyperParamSetterWithFunc(
+            'learning_rate', partial(_compute_lr, max_lr=max_lr, min_lr=min_lr, cepoch=cyclic_epoch)),
+        ScheduledHyperParamSetter('keep_prob',
+                                  [(0, 1.0),]),
+        HyperParamSetterWithFunc('keep_prob',
+                                 lambda e, x: x * kp_decay if e > 0 else x),
+>>>>>>> 785db795ec78e91078b848caded2f1d5a5ecde83
     ]
+    # num_example = 1280000 if args.dataset == 'imagenet' else 1592085
+    # step_size = num_example // (batch * nr_tower)
+    # max_iter = int(step_size * 300)
+    # max_epoch = (max_iter // step_size) + 1
+    # callbacks = [
+    #     ModelSaver(),
+    #     ScheduledHyperParamSetter('learning_rate',
+    #                               [(0, 0.5),]),
+    #     HyperParamSetterWithFunc('learning_rate',
+    #                              lambda e, x: x * 0.975 if e > 0 else x)
+    # ]
     # callbacks = [
     #     ModelSaver(),
     #     ScheduledHyperParamSetter('learning_rate',
@@ -258,7 +404,10 @@ if __name__ == '__main__':
     parser.add_argument('--gpu', help='comma separated list of GPU(s) to use.')
     parser.add_argument('--data', help='ILSVRC or OpenImage dataset dir')
     parser.add_argument('--batch', help='batch size', type=int, default=128)
+    parser.add_argument('--lr', help='initial learning rage', type=float, default=0.4)
     parser.add_argument('--parallel', help='number of cpu workers prefetching data', type=int, default=0)
+    parser.add_argument('--multiplier', help='network channel multiplier', type=float, default=1.0)
+    parser.add_argument('--logdir', help='checkpoint directory', type=str, default='')
     # parser.add_argument('-r', '--ratio', type=float, default=0.5, choices=[1., 0.5])
     # parser.add_argument('--group', type=int, default=8, choices=[3, 4, 8],
     #                     help="Number of groups for ShuffleNetV1")
@@ -305,6 +454,8 @@ if __name__ == '__main__':
                     "as 1 flop because it can be executed in one instruction.")
     else:
         name = 'avanet'
+        if args.logdir:
+            name = args.logdir
         logger.set_logger_dir(os.path.join('train_log', name))
 
         nr_tower = max(get_num_gpu(), 1)
